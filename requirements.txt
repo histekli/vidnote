@@ -1,0 +1,7 @@
+numpy
+pillow
+rapidocr-onnxruntime
+faster-whisper
+yt-dlp
+flask
+requests

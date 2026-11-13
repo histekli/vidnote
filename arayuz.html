@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VidNote</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --panel: #ffffff; --ink: #1c1b19; --muted: #6d6a63; --line: #e4e1d9;
+    --accent: #1f5f4a; --accent-ink: #ffffff; --soft: #eef3ef; --warn: #a23a2a; --warn-soft: #fbeeeb;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161614; --panel: #1f1f1c; --ink: #ecebe6; --muted: #9a978f; --line: #33322e;
+            --accent: #6fbf9f; --accent-ink: #10201a; --soft: #24302b; --warn: #f0907f; --warn-soft: #3a2420; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  button, input { font: inherit; color: inherit; }
+  .app { display: grid; grid-template-columns: 340px 1fr; height: 100%; }
+  aside { border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .brand { padding: 20px 20px 6px; display: flex; align-items: baseline; justify-content: space-between; }
+  .brand h1 { margin: 0; font-size: 19px; letter-spacing: -0.01em; }
+  .brand span { font-size: 12px; color: var(--muted); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-right: 5px; vertical-align: 1px; }
+  .dot.on { background: var(--accent); }
+  .new { padding: 12px 20px 16px; border-bottom: 1px solid var(--line); }
+  .row { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; min-width: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .btn { padding: 9px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); cursor: pointer; white-space: nowrap; }
+  .btn:hover { border-color: var(--muted); }
+  a.btn { color: inherit; text-decoration: none; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .drop { margin-top: 10px; padding: 14px; border: 1.5px dashed var(--line); border-radius: 8px; text-align: center; color: var(--muted); font-size: 13px; cursor: pointer; }
+  .drop.over { border-color: var(--accent); background: var(--soft); color: var(--ink); }
+  .msg { margin-top: 8px; font-size: 13px; color: var(--warn); min-height: 0; }
+  .list { overflow-y: auto; flex: 1; padding: 8px 10px 20px; }
+  .list h2 { margin: 14px 10px 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; }
+  .item { display: block; width: 100%; text-align: left; padding: 9px 10px; border: 0; border-radius: 8px; background: none; cursor: pointer; }
+  .item:hover { background: var(--soft); }
+  .item.sel { background: var(--soft); box-shadow: inset 3px 0 0 var(--accent); }
+  .item b { display: block; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item small { color: var(--muted); font-size: 12px; }
+  .job { padding: 9px 10px; border-radius: 8px; background: var(--soft); margin-bottom: 6px; font-size: 13px; }
+  .job b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .job.err { background: var(--warn-soft); color: var(--warn); }
+  .job.err button { margin-top: 6px; padding: 3px 9px; font-size: 12px; }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: s 0.8s linear infinite; margin-right: 6px; vertical-align: -1px; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+  main { overflow-y: auto; min-height: 0; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 36px 60px; }
+  .empty { max-width: 560px; margin: 12vh auto 0; color: var(--muted); }
+  .empty h2 { color: var(--ink); font-size: 22px; margin: 0 0 10px; letter-spacing: -0.01em; }
+  .empty ol { padding-left: 20px; }
+  .empty li { margin: 6px 0; }
+  .head h2 { margin: 0 0 4px; font-size: 22px; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+  .head p { margin: 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 22px; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 32px; align-items: start; }
+  .doc h3 { margin: 26px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .doc h3:first-child { margin-top: 0; }
+  .doc p, .doc li { margin: 0 0 9px; overflow-wrap: anywhere; }
+  .doc ul { margin: 0; padding: 0; list-style: none; }
+  .doc .note { color: var(--muted); font-size: 13px; }
+  .doc .meta { color: var(--muted); font-size: 13px; margin-bottom: 3px; }
+  .t { font-family: var(--mono); font-size: 12px; color: var(--accent); margin-right: 8px; }
+  .sheets { position: sticky; top: 20px; }
+  .sheets h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .sheets a { display: block; margin-bottom: 10px; }
+  .sheets img { width: 100%; border-radius: 8px; border: 1px solid var(--line); display: block; }
+  .sheets small { color: var(--muted); font-size: 12px; }
+  @media (max-width: 900px) {
+    .app { grid-template-columns: 1fr; height: auto; }
+    aside { border-right: 0; border-bottom: 1px solid var(--line); }
+    .list { max-height: 260px; }
+    .cols { grid-template-columns: 1fr; }
+    .sheets { position: static; }
+    .wrap { padding: 22px 18px 50px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand">
+      <h1>VidNote</h1>
+      <span id="tg"><i class="dot"></i>Telegram kapalı</span>
+    </div>
+    <div class="new">
+      <form class="row" id="form">
+        <input type="text" id="url" placeholder="Video linki yapıştır" autocomplete="off" aria-label="Video linki">
+        <button class="btn primary" id="go">Dökümü çıkar</button>
+      </form>
+      <div class="drop" id="drop" role="button" tabindex="0">ya da video / paket (.zip) dosyasını buraya bırak</div>
+      <input type="file" id="file" accept="video/*,.mkv,.zip" hidden>
+      <div class="msg" id="msg" role="alert"></div>
+    </div>
+    <div class="list">
+      <div id="jobs"></div>
+      <h2 id="histTitle" hidden>Dökümler</h2>
+      <div id="notes"></div>
+    </div>
+  </aside>
+  <main>
+    <div class="wrap" id="view"></div>
+  </main>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+let selected = null, mine = new Set(), known = new Set(), firstLoad = true;
+
+const fmtDur = s => { s = Math.round(s); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+const say = t => { $('msg').textContent = t || ''; };
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || 'İstek başarısız oldu (' + r.status + ').');
+  return data;
+}
+
+async function submitUrl(e) {
+  e.preventDefault();
+  const url = $('url').value.trim();
+  if (!url) return;
+  say('');
+  try {
+    const j = await api('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+    mine.add(j.id); $('url').value = ''; refresh();
+  } catch (err) { say(err.message); }
+}
+
+async function submitFile(file) {
+  if (!file) return;
+  say('');
+  const fd = new FormData(); fd.append('file', file);
+  $('drop').textContent = 'Yükleniyor: ' + file.name;
+  try {
+    const j = await api('/api/jobs', { method: 'POST', body: fd });
+    mine.add(j.id); refresh();
+  } catch (err) { say(err.message); }
+  $('drop').textContent = 'ya da video / paket (.zip) dosyasını buraya bırak';
+}
+
+async function refresh() {
+  let st;
+  try { st = await api('/api/status'); } catch (e) { say('Uygulamaya ulaşılamıyor. Terminalde çalıştığından emin ol.'); return; }
+  $('tg').replaceChildren(el('i', 'dot' + (st.telegram ? ' on' : '')), document.createTextNode(st.telegram ? 'Telegram açık' : 'Telegram kapalı'));
+  const box = $('jobs'); box.replaceChildren();
+  for (const j of st.active) {
+    const d = el('div', 'job' + (j.status === 'error' ? ' err' : ''));
+    d.append(el('b', null, j.title));
+    if (j.status === 'error') {
+      d.append(document.createTextNode(j.error || 'Hata'));
+      const b = el('button', 'btn', 'Kapat');
+      b.onclick = async () => { await api('/api/jobs/' + j.id + '/dismiss', { method: 'POST' }); refresh(); };
+      d.append(el('br'), b);
+    } else {
+      d.append(el('i', 'spin'), document.createTextNode(j.stage + (j.origin === 'telegram' ? ' · Telegram' : '')));
+    }
+    box.append(d);
+  }
+  const { notes } = await api('/api/notes');
+  $('histTitle').hidden = !notes.length;
+  const list = $('notes'); list.replaceChildren();
+  let fresh = null;
+  for (const n of notes) {
+    if (!known.has(n.id)) { known.add(n.id); if (!firstLoad && mine.has(n.id)) fresh = n.id; }
+    const b = el('button', 'item' + (n.id === selected ? ' sel' : ''));
+    b.append(el('b', null, n.title), el('small', null, n.created + ' · ' + fmtDur(n.duration) + (n.uploader ? ' · ' + n.uploader : '')));
+    b.onclick = () => openNote(n.id);
+    list.append(b);
+  }
+  firstLoad = false;
+  if (fresh) openNote(fresh);
+  else if (!selected) renderEmpty(st, notes.length);
+  clearTimeout(refresh.timer);
+  refresh.timer = setTimeout(refresh, st.active.some(j => j.status !== 'error') ? 1500 : 5000);
+}
+
+function renderEmpty(st) {
+  const v = $('view'); v.replaceChildren();
+  const e = el('div', 'empty');
+  e.append(el('h2', null, 'Videoyu yazıya dök'));
+  e.append(el('p', null, 'Bir video ver; açıklamasını, konuşmasını ve ekrandaki yazıları tek bir dökümde topla. Özet değil, tam döküm çıkar; dökümü istediğin yapay zekâya verebilirsin.'));
+  const ol = el('ol');
+  ol.append(el('li', null, 'Soldaki kutuya Instagram, YouTube ya da başka bir video linki yapıştır; ya da dosyayı sürükle.'));
+  ol.append(el('li', null, 'İşlem bu bilgisayarda yapılır. İki dakikalık bir video için bir iki dakika sürebilir.'));
+  ol.append(el('li', null, st.telegram ? 'Telefondan: videoyu Telegram botuna gönder; döküm sohbete geri gelir ve burada da listelenir.'
+                                       : 'Terminalden de çalışır: vidnote <link>. Orada çıkan dökümler bu listede de görünür.'));
+  e.append(ol);
+  e.append(el('p', null, 'Dökümler şu klasörde saklanır: ' + st.notes_dir));
+  v.append(e);
+}
+
+function renderDoc(md) {
+  const doc = el('div', 'doc');
+  let ul = null, first = true;
+  const timed = (parent, text) => {
+    const m = text.match(/^\[(\d+:\d\d(?::\d\d)?)\]\s*(.*)$/);
+    if (m) { parent.append(el('span', 't', m[1]), document.createTextNode(m[2])); } else parent.append(document.createTextNode(text));
+  };
+  for (const raw of md.split('\n')) {
+    const line = raw.trimEnd();
+    if (!line) { ul = null; continue; }
+    if (line.startsWith('## Görseller')) break;
+    if (line.startsWith('# ')) continue;
+    if (line.startsWith('## ')) { ul = null; first = false; doc.append(el('h3', null, line.slice(3))); continue; }
+    if (line.startsWith('- ')) {
+      if (first) { doc.append(el('div', 'meta', line.slice(2))); continue; }
+      if (!ul) { ul = el('ul'); doc.append(ul); }
+      const li = el('li'); timed(li, line.slice(2)); ul.append(li); continue;
+    }
+    ul = null;
+    if (/^_.*_$/.test(line)) { doc.append(el('p', 'note', line.slice(1, -1))); continue; }
+    const p = el('p'); timed(p, line); doc.append(p);
+  }
+  return doc;
+}
+
+async function openNote(id) {
+  let n;
+  try { n = await api('/api/notes/' + id); } catch (e) { say(e.message); return; }
+  selected = id;
+  document.querySelectorAll('.item').forEach(b => b.classList.remove('sel'));
+  const v = $('view'); v.replaceChildren();
+  const head = el('div', 'head');
+  head.append(el('h2', null, n.title), el('p', null, n.source));
+  const actions = el('div', 'actions');
+  const copy = el('button', 'btn primary', 'Dökümü kopyala');
+  copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(n.transcript); copy.textContent = 'Kopyalandı'; }
+    catch (e) { copy.textContent = 'Kopyalanamadı'; }
+    setTimeout(() => copy.textContent = 'Dökümü kopyala', 1600);
+  };
+  const dl = el('a', 'btn', 'Dosyayı indir (.md)'); dl.href = '/files/' + id + '/transkript.md?indir=1'; dl.style.textDecoration = 'none';
+  const open = el('button', 'btn', 'Klasörü aç');
+  open.onclick = async () => { const r = await api('/api/notes/' + id + '/open', { method: 'POST' }); if (!r.ok) say('Klasör: ' + r.path); };
+  actions.append(copy, dl, open);
+  const cols = el('div', 'cols');
+  cols.append(renderDoc(n.transcript));
+  const side = el('div', 'sheets');
+  side.append(el('h3', null, 'Kareler (' + n.frames + ')'));
+  for (const s of n.sheets) {
+    const a = el('a'); a.href = '/files/' + id + '/sheets/' + s; a.target = '_blank'; a.rel = 'noopener';
+    const img = el('img'); img.src = a.href; img.alt = 'Videodan seçilen kareler'; img.loading = 'lazy';
+    a.append(img); side.append(a);
+  }
+  side.append(el('small', null, 'Görüntüde ne olduğunu da anlatması için bu görseli dökümle birlikte modele ver.'));
+  cols.append(side);
+  v.append(head, actions, cols);
+  $('view').parentElement.scrollTop = 0;
+  refresh();
+}
+
+$('form').addEventListener('submit', submitUrl);
+const drop = $('drop');
+drop.onclick = () => $('file').click();
+drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('file').click(); } };
+$('file').onchange = e => { submitFile(e.target.files[0]); e.target.value = ''; };
+['dragenter', 'dragover'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
+document.addEventListener('drop', e => submitFile(e.dataTransfer.files[0]));
+refresh();
+</script>
+</body>
+</html>

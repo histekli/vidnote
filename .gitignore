@@ -1,0 +1,14 @@
+# Kullanıcı ayarları ve sırlar
+ayarlar.env
+cookies.txt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# VidNote çıktıları ve geçici dosyalar
+VidNote/
+*.zip
+*.mp4
+.DS_Store

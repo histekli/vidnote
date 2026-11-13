@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "VidNote Yakala",
+  "version": "0.1.0",
+  "description": "Açık olan Instagram gönderisinin videosunu, açıklamasını ve yorumlarını tek pakette toplar; VidNote'a gönderir ya da .zip olarak indirir.",
+  "minimum_chrome_version": "111",
+  "action": { "default_title": "Bu gönderiyi VidNote paketi yap" },
+  "background": { "service_worker": "sw.js" },
+  "permissions": ["scripting", "storage"],
+  "host_permissions": [
+    "https://www.instagram.com/*",
+    "https://*.cdninstagram.com/*",
+    "https://*.fbcdn.net/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "content_scripts": [
+    { "matches": ["https://www.instagram.com/*"], "js": ["extract.js", "hook.js"], "run_at": "document_start", "world": "MAIN" }
+  ],
+  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" }
+}

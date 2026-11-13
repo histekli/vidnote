@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# VidNote başlatıcı (Linux ve macOS): kurulumdaki sanal ortamı kullanır, yoksa sistem Python'una düşer.
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do                       # ~/.local/bin altındaki bağlantıyı gerçek klasöre çöz
+  TARGET="$(readlink "$SRC")"
+  case "$TARGET" in /*) SRC="$TARGET" ;; *) SRC="$(dirname "$SRC")/$TARGET" ;; esac
+done
+DIR="$(cd "$(dirname "$SRC")" && pwd)"
+PY="$DIR/.venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+exec "$PY" "$DIR/app.py" "$@"
