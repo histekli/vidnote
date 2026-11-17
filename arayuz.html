@@ -182,7 +182,7 @@ async function refresh() {
   for (const n of notes) {
     if (!known.has(n.id)) { known.add(n.id); if (!firstLoad && mine.has(n.id)) fresh = n.id; }
     const b = el('button', 'item' + (n.id === selected ? ' sel' : ''));
-    b.append(el('b', null, n.title), el('small', null, n.created + ' · ' + (n.duration ? fmtDur(n.duration) : n.frames + ' görsel') + (n.uploader ? ' · ' + n.uploader : '')));
+    b.append(el('b', null, n.title), el('small', null, n.created + ' · ' + (n.kind === 'text' ? 'metin' : n.duration ? fmtDur(n.duration) : n.frames + ' görsel') + (n.uploader ? ' · ' + n.uploader : '')));
     b.onclick = () => openNote(n.id);
     list.append(b);
   }

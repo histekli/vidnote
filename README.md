@@ -40,6 +40,7 @@ Mac'te Instagram linkleri için en kolay yol `ayarlar.env` içinde `COOKIES_BROW
 ```
 vidnote "https://www.youtube.com/watch?v=..."     # dökümü ekrana yazar ve kaydeder
 vidnote "https://www.instagram.com/p/..."          # görsel ya da çoklu görsel gönderi: açıklama + görsellerdeki yazılar
+vidnote "https://www.threads.com/@kul/post/..."    # Threads gönderisi (video/görsel/carousel/metin); çerez gerekir
 vidnote video.mp4 --description "gönderi metni"    # dosyadan; açıklamayı elle ver
 vidnote ekran_goruntusu.png                        # tek görsel de olur
 vidnote instagram_hesap_KOD.zip                    # eklentinin ürettiği paket (video + açıklama + yorumlar)
@@ -147,6 +148,21 @@ indirilir (video indiricisi yt-dlp görsel indirmez). Çıkan dökümde açıkla
 ("Görsel 1: …") ve görsellerin numaralı kontak baskısı bulunur. Gönderide video da varsa ilk video normal
 biçimde işlenir, görseller "Gönderideki görseller" bölümüne eklenir.
 Görselde *ne olduğu* (yazı dışındaki içerik) metne çevrilmez; onu görsel dosyasını modele vererek alırsın.
+
+## Threads gönderileri
+
+`threads.com` ve `threads.net` linkleri desteklenir: video, tek görsel, çoklu görsel (carousel) ve yalnızca metin
+gönderileri. Döküm, gönderi türüne göre video dökümü, görsel dökümü ya da (metin gönderisinde) yalnızca açıklama olur.
+Bağlantı biçimleri: `/@kullanici/post/<kod>`, `/t/<kod>` ve yönlendirmeli `/share/<kod>` (son adresten kod çözülür).
+
+**Çerez zorunlu.** Threads gönderi verisini yalnızca giriş yapmış oturuma gömüyor; girişsiz istekler (hangi
+User-Agent'la olursa olsun) yalnızca giriş duvarını döndürür. Bu yüzden `ayarlar.env` içinde `COOKIES_BROWSER`
+(Threads'e giriş yaptığın tarayıcı) ya da `COOKIES_FILE` (dışa aktardığın cookies.txt) ayarlanmış olmalı —
+Instagram'daki ile aynı yol. Çerez yoksa VidNote neyi ayarlaman gerektiğini söyleyen bir hata verir.
+
+Threads için yt-dlp/gallery-dl kullanılmaz; sayfaya gömülü JSON (`data-sjs`) doğrudan ayrıştırılır. Threads bu gömülü
+verinin biçimini zaman zaman değiştirdiği için bu yol kırılgandır; biçim değişirse ayrıştırma "gönderi verisi
+bulunamadı" hatası verebilir.
 
 ## Güncelleme
 

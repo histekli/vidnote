@@ -462,7 +462,7 @@ def cmd_list(argv):
     if not notes:
         print("Henüz döküm yok.")
     for n in notes:
-        size = vidnote.mmss(n["duration"]) if n["duration"] else f"{n['frames']} grs"
+        size = "metin" if n.get("kind") == "text" else (vidnote.mmss(n["duration"]) if n["duration"] else f"{n['frames']} grs")
         print(f"{n['id']}  {size:>6}  {n['title'][:70]}")
 
 
