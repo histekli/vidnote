@@ -17,16 +17,19 @@ import argparse
 import datetime
 import difflib
 import json
+import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import wave
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -61,13 +64,64 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def ff(cmd):
+    """ffmpeg/ffprobe çalıştırır; hata olursa aracın kendi mesajını okunur biçimde verir."""
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if r.returncode != 0:
+        tail = " | ".join((r.stderr or "").strip().splitlines()[-3:])
+        raise VidnoteError(f"{Path(cmd[0]).name} hata verdi (kod {r.returncode}): {tail or 'ayrıntı yok'}")
+    return r.stdout
+
+
 def mmss(t):
     t = int(round(t))
     return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60:02d}:{t % 60:02d}"
 
 
 # ---- girdi ----------------------------------------------------------------
-def fetch_url(url, workdir, cookies_from_browser=None, cookies_file=None, max_comments=0):
+def parse_json3(data, max_sec=8.0, max_words=28):
+    """YouTube'un json3 altyazısını zaman damgalı, okunur uzunlukta bölümlere çevirir."""
+    out = []
+    for ev in data.get("events") or []:
+        text = " ".join("".join(x.get("utf8", "") for x in ev.get("segs") or []).split())
+        if not text:
+            continue
+        start = (ev.get("tStartMs") or 0) / 1000
+        end = start + (ev.get("dDurationMs") or 0) / 1000
+        last = out[-1] if out else None
+        if last and start - last["start"] < max_sec and len(last["text"].split()) < max_words and not last["text"].endswith((".", "?", "!")):
+            last["text"] += " " + text                   # otomatik altyazı 2-3 kelimelik parçalar hâlinde gelir
+            last["end"] = max(last["end"], end)
+        else:
+            out.append({"start": start, "end": end, "text": text})
+    return out
+
+
+def site_captions(ydl, info, want_lang):
+    """Sitenin (YouTube) hazır altyazısını bulur: önce elle yazılmış, sonra otomatik.
+    (bölümler, dil, ad) döndürür; yoksa ([], None, None)."""
+    lang = (want_lang or info.get("language") or "").split("-")[0]
+    cands = []
+    for table, label in ((info.get("subtitles") or {}, "sitenin altyazısı"), (info.get("automatic_captions") or {}, "sitenin otomatik altyazısı")):
+        keys = [k for k in table if lang and (k == lang or k.startswith(lang + "-"))]
+        keys.sort(key=lambda k: (not k.endswith("-orig"), k != lang, k))
+        for k in keys[:2]:
+            fmt = next((f for f in table[k] if f.get("ext") == "json3" and f.get("url")), None)
+            if fmt:
+                cands.append((fmt["url"], k, label))
+    for cap_url, key, label in cands[:3]:
+        try:
+            segs = parse_json3(json.loads(ydl.urlopen(cap_url).read().decode("utf-8")))
+        except Exception as e:
+            log(f"uyarı: altyazı alınamadı ({key}): {str(e)[:120]}")
+            continue
+        if len(segs) >= 2:
+            return segs, key.split("-")[0], f"{label} ({key})"
+    return [], None, None
+
+
+def fetch_url(url, workdir, cookies_from_browser=None, cookies_file=None, max_comments=0, progress=None,
+              max_height=720, use_captions=True, lang=None):
     """URL'yi yt-dlp ile indirir (en fazla 720p). (yol, üst veri) döndürür.
     Üst veri: başlık, açıklama, hesap, yayın tarihi, sayfa adresi."""
     try:
@@ -76,12 +130,23 @@ def fetch_url(url, workdir, cookies_from_browser=None, cookies_file=None, max_co
         raise VidnoteError("Link için yt-dlp gerekli:  pip install yt-dlp")
     opts = {
         "outtmpl": str(Path(workdir) / "source.%(ext)s"),
-        "format": "bv*[height<=720]+ba/b[height<=720]/b",
+        "format": f"bv*[height<={max_height}]+ba/b[height<={max_height}]/b",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
     }
+    def hook(d):                               # indirme sürerken yüzdeyi arayüze bildir
+        if not progress or d.get("status") != "downloading":
+            return
+        done = d.get("downloaded_bytes") or 0
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        what = "Ses" if (d.get("info_dict") or {}).get("vcodec") == "none" else "Video"
+        if total:
+            progress(f"{what} indiriliyor: %{int(done * 100 / total)} ({done / 1048576:.1f} / {total / 1048576:.1f} MB)", min(done / total, 1.0))
+        else:
+            progress(f"{what} indiriliyor: {done / 1048576:.1f} MB", None)
+    opts["progress_hooks"] = [hook]
     if max_comments > 0:                       # yorumlar isteğe bağlı; bazı sitelerde yavaştır
         opts["getcomments"] = True
         opts["extractor_args"] = {"youtube": {"max_comments": [str(max_comments), "all", "20", "5"]}}
@@ -91,7 +156,20 @@ def fetch_url(url, workdir, cookies_from_browser=None, cookies_file=None, max_co
         if not Path(cookies_file).expanduser().exists():
             raise VidnoteError(f"Çerez dosyası bulunamadı: {cookies_file}")
         opts["cookiefile"] = str(Path(cookies_file).expanduser())
+    ready = None
     try:
+        if use_captions and re.search(r"//([\w.]*\.)?(youtube\.com|youtu\.be)/", url):
+            # Hazır altyazı varsa ses indirilmez ve konuşma çözülmez: hem veri hem süre kazanılır
+            try:
+                with yt_dlp.YoutubeDL(dict(opts, progress_hooks=[])) as ydl:
+                    pre = ydl.extract_info(url, download=False)
+                    segs, cap_lang, cap_name = site_captions(ydl, pre, lang)
+                if segs:
+                    ready = (segs, cap_lang, cap_name)
+                    opts["format"] = f"bv*[height<={max_height}]/b[height<={max_height}]/b"
+                    log(f"hazır altyazı bulundu: {cap_name}; yalnızca görüntü indirilecek")
+            except Exception as e:
+                log(f"uyarı: hazır altyazıya bakılamadı ({str(e)[:120]}); video sesiyle indirilecek")
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             path = ydl.prepare_filename(info)
@@ -116,29 +194,100 @@ def fetch_url(url, workdir, cookies_from_browser=None, cookies_file=None, max_co
         "stats": {k: v for k, v in (("likes", info.get("like_count")), ("comments", info.get("comment_count")),
                                     ("plays", info.get("view_count"))) if isinstance(v, (int, float))},
     }
+    if ready:
+        meta["ready_transcript"] = ready
     return str(p), meta, comments_from_ytdlp(info, max_comments) if max_comments > 0 else []
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".3gp"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def collect_gallery(folder):
+    """gallery-dl'nin indirdiği klasörden görselleri, videoları ve gönderi bilgisini toplar.
+    Dosya adları sıra numarasıyla başladığı için ad sırası = gönderideki sıra."""
+    files = sorted(f for f in Path(folder).iterdir() if f.suffix.lower() in IMAGE_SUFFIXES | VIDEO_SUFFIXES)
+    info = {}
+    for f in files:
+        j = Path(str(f) + ".json")
+        if j.exists():
+            try:
+                d = json.loads(j.read_text(encoding="utf-8"))
+            except ValueError:
+                continue
+            if not info or (d.get("description") and not info.get("description")):
+                info = d
+    user, code = info.get("username") or "", info.get("post_shortcode") or ""
+    meta = {
+        "title": " · ".join(x for x in (f"@{user}" if user else "", code) if x) or "Instagram gönderisi",
+        "description": info.get("description") or "",
+        "uploader": user,
+        "upload_date": str(info.get("post_date") or info.get("date") or "")[:10],
+        "webpage_url": info.get("post_url") or "",
+        "site": "Instagram",
+        "stats": {"likes": info["likes"]} if isinstance(info.get("likes"), (int, float)) and info["likes"] > 0 else {},
+    }
+    return ([f for f in files if f.suffix.lower() in IMAGE_SUFFIXES],
+            [f for f in files if f.suffix.lower() in VIDEO_SUFFIXES], meta)
+
+
+def fetch_instagram_post(url, workdir, cookies_from_browser=None, cookies_file=None):
+    """Görsel ya da çoklu Instagram gönderisini gallery-dl ile indirir (yt-dlp yalnızca video indirir)."""
+    dest = Path(workdir) / "gal"
+    dest.mkdir(exist_ok=True)
+    cmd = [sys.executable, "-m", "gallery_dl", "-q", "-D", str(dest), "--write-metadata", "--no-mtime",
+           "-f", "{num:>03}_{media_id}.{extension}"]
+    if cookies_from_browser:
+        cmd += ["--cookies-from-browser", cookies_from_browser]
+    if cookies_file:
+        cmd += ["--cookies", str(Path(cookies_file).expanduser())]
+    try:
+        r = subprocess.run(cmd + [url], capture_output=True, text=True, errors="replace", timeout=900)
+    except subprocess.TimeoutExpired:
+        raise VidnoteError("Gönderi indirilemedi: işlem 15 dakikada bitmedi.")
+    images, videos, meta = collect_gallery(dest)
+    if not images and not videos:
+        err = (r.stderr or "").strip()
+        if "No module named" in err:
+            raise VidnoteError("Görsel gönderiler için gallery-dl gerekli. Kurulum klasöründe ./kur.sh komutunu yeniden çalıştır.")
+        if "login" in err.lower():
+            if cookies_from_browser or cookies_file:
+                raise VidnoteError("Instagram bu gönderi için giriş istiyor ve ayarlardaki çerezlerle giriş kabul edilmedi. "
+                                   "O tarayıcıda Instagram'a giriş yapılı mı? Çıkış yapıp yeniden girmek çoğu zaman çözer.")
+            raise VidnoteError("Instagram bu gönderi için giriş istiyor. VidNote klasöründeki ayarlar.env dosyasında "
+                               "COOKIES_BROWSER= satırına Instagram'a giriş yaptığın tarayıcıyı yaz (chrome, safari, firefox, brave, edge), "
+                               "sonra VidNote'u kapatıp yeniden aç.")
+        raise VidnoteError("Gönderi indirilemedi: " + (" | ".join(err.splitlines()[-2:]) or "gallery-dl hiçbir dosya indirmedi"))
+    if not meta["webpage_url"]:
+        meta["webpage_url"] = url
+    return images, videos, meta
 
 
 def open_package(zip_path, workdir):
-    """VidNote paketini açar: içinde bir video ve paket.json (açıklama, hesap, yorumlar) bulunur.
-    Tarayıcı eklentisi bu paketi üretir. (video yolu, üst veri, yorumlar) döndürür."""
+    """VidNote paketini açar: içinde bir video ve/veya görseller ile paket.json (açıklama, hesap, yorumlar) bulunur.
+    Tarayıcı eklentisi bu paketi üretir. (video yolu ya da None, görseller, üst veri, yorumlar) döndürür."""
     try:
         zf = zipfile.ZipFile(zip_path)
     except zipfile.BadZipFile:
         raise VidnoteError("Bu .zip dosyası açılamadı.")
     with zf:
-        names = [i for i in zf.infolist() if not i.is_dir()]
+        names = sorted((i for i in zf.infolist() if not i.is_dir()), key=lambda i: i.filename)
         vid = next((i for i in names if Path(i.filename).suffix.lower() in VIDEO_SUFFIXES), None)
-        if vid is None:
-            raise VidnoteError("Pakette video dosyası yok.")
-        if vid.file_size > 4 * 1024 ** 3:
-            raise VidnoteError("Paketteki video çok büyük.")
-        dest = Path(workdir) / ("source" + Path(vid.filename).suffix.lower())    # dosya adını pakete bırakma
-        with zf.open(vid) as src, open(dest, "wb") as out:
-            shutil.copyfileobj(src, out)
+        pics = [i for i in names if Path(i.filename).suffix.lower() in IMAGE_SUFFIXES][:40]
+        if vid is None and not pics:
+            raise VidnoteError("Pakette video ya da görsel yok.")
+        if any(i.file_size > 4 * 1024 ** 3 for i in ([vid] if vid else []) + pics):
+            raise VidnoteError("Paketteki dosya çok büyük.")
+        dest, images = None, []
+        if vid is not None:
+            dest = Path(workdir) / ("source" + Path(vid.filename).suffix.lower())    # dosya adını pakete bırakma
+            with zf.open(vid) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+        for n, i in enumerate(pics, 1):
+            f = Path(workdir) / f"pkgimg_{n:03d}{Path(i.filename).suffix.lower()}"
+            with zf.open(i) as src, open(f, "wb") as out:
+                shutil.copyfileobj(src, out)
+            images.append(f)
         info = {}
         js = next((i for i in names if Path(i.filename).name == "paket.json"), None)
         if js is not None and js.file_size < 20 * 1024 ** 2:
@@ -158,7 +307,7 @@ def open_package(zip_path, workdir):
         "stats": {k: stats[k] for k in ("likes", "comments", "plays") if isinstance(stats.get(k), (int, float))},
     }
     comments = [c for c in (info.get("comments") or []) if isinstance(c, dict) and str(c.get("text", "")).strip()]
-    return str(dest), meta, comments
+    return (str(dest) if dest else None), images, meta, comments
 
 
 def comments_from_ytdlp(info, limit):
@@ -176,9 +325,7 @@ def comments_from_ytdlp(info, limit):
 
 
 def probe(path):
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path],
-        capture_output=True, text=True, check=True).stdout
+    out = ff(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path])
     info = json.loads(out)
     v = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
     if v is None:
@@ -224,7 +371,7 @@ def select_frames(path, fps, duration, max_frames):
            "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     nbytes = AW * AH * 3
-    kept, revisits = [], []
+    kept, revisits, motions = [], [], []
     cur = 0               # ekranda şu an hangi seçilmiş karenin planı var
     since_new = False     # son dönüş notundan beri yeni bir kare seçildi mi
     next_ok_t = 0.0       # hareketli çekimde bir sonraki kontrol zamanı
@@ -245,6 +392,7 @@ def select_frames(path, fps, duration, max_frames):
             motion = float(np.abs(f - prev).mean() / 255.0)
             step = changed_fraction(f, prev)
         stable_run = stable_run + 1 if (motion <= SETTLE_THR and step <= STILL_STEP) else 0
+        motions.append(motion)
         prev = f
 
         if ref is None:                       # ilk kare
@@ -314,7 +462,7 @@ def select_frames(path, fps, duration, max_frames):
                 r["of"] -= 1
         kept.pop(j)
     revisits = [r for r in revisits if r["of"] is not None]
-    return kept, revisits, analyzed
+    return kept, revisits, analyzed, motions
 
 
 def extract_frames(path, fps, kept, outdir, full_side=1280):
@@ -322,8 +470,15 @@ def extract_frames(path, fps, kept, outdir, full_side=1280):
     outdir.mkdir(parents=True, exist_ok=True)
     sel = "+".join(f"eq(n\\,{k['idx']})" for k in kept)
     scale = f"scale='if(gt(iw,ih),min(iw,{full_side}),-2)':'if(gt(iw,ih),-2,min(ih,{full_side}))'"
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-vf", f"fps={fps},select='{sel}',{scale}",
-                    "-vsync", "0", "-q:v", "2", str(outdir / "raw_%04d.jpg")], check=True)
+    head = ["ffmpeg", "-v", "error", "-y", "-i", path, "-vf", f"fps={fps},select='{sel}',{scale}"]
+    tail = ["-q:v", "2", str(outdir / "raw_%04d.jpg")]
+    try:                                            # yeni ffmpeg: -vsync kaldırıldı, yerine -fps_mode geldi
+        ff(head + ["-fps_mode", "passthrough"] + tail)
+    except VidnoteError as first:
+        try:                                        # ffmpeg 5.1 öncesi yalnızca -vsync'i tanır
+            ff(head + ["-vsync", "0"] + tail)
+        except VidnoteError:
+            raise first
     files = sorted(outdir.glob("raw_*.jpg"))
     if len(files) != len(kept):
         log(f"uyarı: {len(kept)} kare beklenirken {len(files)} çıktı")
@@ -359,6 +514,7 @@ def ocr_image(path, langs):
 
 
 _tess_cache = {}
+_tess_min = {}        # okunan satır -> en düşük kelime güveni (konuşmayı düzeltirken hangi satıra güvenileceği)
 MIN_TEXT_H = 0.012    # kare yüksekliğinin %1,2'sinden küçük satırlar OCR'a alınmaz
 
 
@@ -381,6 +537,7 @@ def tess_line(crop, langs):
         if len(r) >= 12 and re.search(r"\w", r[11]):
             words.append(r[11].strip())
             confs.append(float(r[10]))
+    _tess_min[" ".join(words)] = min(confs) if confs else 0.0
     return " ".join(words), (sum(confs) / len(confs) if confs else 0.0)
 
 
@@ -416,6 +573,7 @@ def ocr_frame(path, langs, detector, have_tess):
         h = by1 - by0
         x0, x1 = int(max(0, bx0 - h * 0.3)), int(min(W, bx1 + h * 0.3))
         y0, y1 = int(max(0, by0 - h * 0.2)), int(min(H, by1 + h * 0.2))
+        conf = 0.0                      # yalnızca tesseract okuması seçilirse dolar
         if have_tess and y1 - y0 >= 8:
             key = (text, x0 // 16, y0 // 16, x1 // 16, y1 // 16)
             if key not in _tess_cache:
@@ -423,13 +581,45 @@ def ocr_frame(path, langs, detector, have_tess):
             ttxt, tconf = _tess_cache[key]
             n_r, n_t = len(re.findall(r"\w", text)), len(re.findall(r"\w", ttxt))
             if tconf >= 60 and n_t >= 0.7 * n_r:
-                text = ttxt
+                text, conf = ttxt, _tess_min.get(ttxt, 0.0)
         if h / H < MIN_TEXT_H:          # okunamayacak kadar küçük yazı: uydurma riski yüksek
             continue
         if rconf >= 0.5 and len(re.findall(r"\w", text)) >= 2:
             lines.append({"text": text, "y": round((by0 + by1) / 2 / H, 3), "h": round(h / H, 3),
-                          "x0": bx0 / W, "x1": bx1 / W})
+                          "x0": bx0 / W, "x1": bx1 / W, "conf": conf})
     return reading_order(lines)
+
+
+OCR_WORKERS = int(os.environ.get("VIDNOTE_OCR_WORKERS") or max(1, min(4, (os.cpu_count() or 2) // 2)))
+_ocr_local = threading.local()
+
+
+def thread_detector():
+    """Her iş parçacığına kendi metin dedektörü (aynı nesne eşzamanlı kullanılmaz)."""
+    if not hasattr(_ocr_local, "det"):
+        from rapidocr_onnxruntime import RapidOCR
+        _ocr_local.det = RapidOCR()
+    return _ocr_local.det
+
+
+def ocr_many(paths, langs, engines):
+    """Birden çok kareyi okur; çekirdek sayısı elveriyorsa paralel."""
+    detector, have_tess, name = engines
+    if name in ("kapalı", "yok"):
+        return [[] for _ in paths]
+    if OCR_WORKERS <= 1 or len(paths) < 2 or detector is None:
+        return [ocr_frame(f, langs, detector, have_tess) for f in paths]
+    with ThreadPoolExecutor(OCR_WORKERS) as ex:
+        return list(ex.map(lambda f: ocr_frame(f, langs, thread_detector(), have_tess), paths))
+
+
+def good_line(text):
+    """OCR çöpünü ayıklar: birbirine yapışmış ya da sesli harf içermeyen 'kelimeler'den oluşan satırlar."""
+    toks = text.split()
+    if not toks:
+        return False
+    bad = sum(1 for t in toks if len(t) > 22 or (len(t) >= 5 and not re.search(r"[aeıioöuüAEIİOÖUÜ0-9]", t)))
+    return bad / len(toks) <= 0.34
 
 
 def reading_order(lines):
@@ -458,58 +648,184 @@ def reading_order(lines):
     return out + sorted([l for l in spanning if l["y"] >= top], key=by_y)
 
 
-def scan_text(path, duration, interval, tmp, langs, detector, have_tess):
+def scan_text(path, duration, interval, tmp, langs, engines):
     """Videoyu düzenli aralıklarla tarayıp ekrandaki yazıların tamamını toplar.
     Kare seçimi görüntü değişimine bakar; bu tarama ise yazıya bakar: hareketli çekimin
     üstüne gelen küçük bir yazı ya da akıp giden altyazılar burada yakalanır."""
     step = max(interval, duration / 600)                 # çok uzun videoda en fazla ~600 örnek
     d = tmp / "scan"
     d.mkdir()
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-vf", f"fps=1/{step:.3f}," + FRAME_SCALE.format(960),
-                    "-q:v", "3", str(d / "s_%05d.jpg")], check=True)
-    items, prev_small, prev_lines = [], None, []
-    for n, f in enumerate(sorted(d.glob("s_*.jpg"))):
-        small = np.asarray(Image.open(f).convert("RGB").resize((AW, AH), Image.BOX)).astype(np.int16)
-        if prev_small is not None and changed_fraction(small, prev_small) < LOCAL_THR / 2:
-            lines = [dict(ln) for ln in prev_lines]      # görüntü aynı: yeniden okumaya gerek yok
-        else:
-            lines = ocr_frame(f, langs, detector, have_tess)
-        prev_small, prev_lines = small, lines
-        items.append({"t": n * step, "t0": n * step, "reason": "scan", "ocr": lines})
+    ff(["ffmpeg", "-v", "error", "-y", "-i", path, "-vf", f"fps=1/{step:.3f}," + FRAME_SCALE.format(960),
+        "-q:v", "3", str(d / "s_%05d.jpg")])
+    files = sorted(d.glob("s_*.jpg"))
+    smalls = [np.asarray(Image.open(f).convert("RGB").resize((AW, AH), Image.BOX)).astype(np.int16) for f in files]
+    # Bir önceki örnekle aynı görünen kareler yeniden okunmaz
+    need = [i for i in range(len(files)) if i == 0 or changed_fraction(smalls[i], smalls[i - 1]) >= LOCAL_THR / 2]
+    read = dict(zip(need, ocr_many([files[i] for i in need], langs, engines)))
+    items, last = [], []
+    for i in range(len(files)):
+        last = read.get(i, last)
+        items.append({"t": i * step, "t0": i * step, "reason": "scan", "ocr": [dict(ln) for ln in last]})
     return items, step
 
 
-def text_streams(scan, kept):
+def text_streams(scan, kept, per_entry=8):
     """Altyazı olmayan ekran yazıları ve altyazılar için iki ayrı akış çıkarır.
-    Ekran yazılarında her satır bir kez listelenir; seçilen karelerdeki (daha yüksek
-    çözünürlüklü) okuma önceliklidir, tarama yalnızca orada olmayanları ekler."""
+    Ekran yazılarında her satır bir kez listelenir; seçilen karelerdeki (daha yüksek çözünürlüklü)
+    okuma önceliklidir. Okunaksız satırlar atılır; kalabalık ekranda en büyük yazılar öne alınır."""
     seen, screen = [], []
     def unseen(key):
         return len(key) >= 3 and not difflib.get_close_matches(key, seen, n=1, cutoff=0.7)
+    def entry(t, lines):                                  # lines: ln sözlükleri (metin + boy)
+        lines = [ln for ln in lines if good_line(ln["text"])]
+        if not lines:
+            return
+        big = sorted(lines, key=lambda ln: -(ln.get("h") or 0))[:per_entry]
+        keep = [ln["text"] for ln in lines if any(ln is b for b in big)]
+        screen.append({"t": t, "lines": keep, "more": len(lines) - len(keep)})
     for k in kept:
-        keys = {ln["text"]: ln["key"] for ln in k.get("ocr", [])}
-        lines = [x for x in k["text_new"] if unseen(keys.get(x, x))]
+        new = [ln for ln in k.get("ocr", []) if ln["text"] in k["text_new"] and unseen(ln["key"])]
         seen += [ln["key"] for ln in k.get("ocr", [])]
-        if lines:
-            screen.append({"t": k["t0"], "lines": lines})
-    for it in scan:
-        keys = {ln["text"]: ln["key"] for ln in it["ocr"]}
-        lines = []
-        for x in it["text_new"]:
-            if unseen(keys.get(x, x)):
-                lines.append(x)
-                seen.append(keys.get(x, x))
-        if lines:
-            screen.append({"t": it["t"], "lines": lines})
+        entry(k["t0"], new)
+    for it in scan or []:
+        new = []
+        for ln in it["ocr"]:
+            if ln["text"] in it["text_new"] and unseen(ln["key"]):
+                new.append(ln)
+                seen.append(ln["key"])
+        entry(it["t"], new)
     screen.sort(key=lambda x: x["t"])
     captions, prev = [], []
-    for it in scan:
-        keys = {ln["text"]: ln["key"] for ln in it["ocr"]}
+    for it in scan or kept:
+        keys = {ln["text"]: ln["key"] for ln in it.get("ocr", [])}
+        conf = {ln["text"]: ln.get("conf") or 0 for ln in it.get("ocr", [])}
         fresh = [c for c in it["text_caption"] if not difflib.get_close_matches(keys.get(c, c), prev, n=1, cutoff=0.8)]
         if fresh:
-            captions.append({"t": it["t"], "lines": fresh})
+            captions.append({"t": it["t0"], "lines": fresh, "trust": [conf.get(c, 0) >= 75 for c in fresh]})
         prev = [keys.get(c, c) for c in it["text_caption"]]
     return screen, captions
+
+
+def _norm1(w):
+    w = unicodedata.normalize("NFKD", w.casefold())
+    return "".join(c for c in w if c.isalnum())
+
+
+def _align_words(xs, ys):
+    """İki kelime dizisini benzerliğe göre hizalar (ör. "houtusu" ~ "howtosu").
+    ("pair", i, j) / ("asr", i, None) / ("cap", None, j) adımlarını sırayla döndürür."""
+    n, m = len(xs), len(ys)
+    sim = [[difflib.SequenceMatcher(None, x, y).ratio() if x and y else 0.0 for y in ys] for x in xs]
+    S = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            hit = S[i - 1][j - 1] + (sim[i - 1][j - 1] if sim[i - 1][j - 1] >= 0.5 else -1.0)
+            S[i][j] = max(hit, S[i - 1][j], S[i][j - 1])
+    ops, i, j = [], n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and sim[i - 1][j - 1] >= 0.5 and S[i][j] == S[i - 1][j - 1] + sim[i - 1][j - 1]:
+            ops.append(("pair", i - 1, j - 1)); i -= 1; j -= 1
+        elif i > 0 and S[i][j] == S[i - 1][j]:
+            ops.append(("asr", i - 1, None)); i -= 1
+        else:
+            ops.append(("cap", None, j - 1)); j -= 1
+    return ops[::-1]
+
+
+def fuse_speech(transcript, captions):
+    """Konuşma dökümünü ekrandaki altyazılarla hizalayıp düzeltir.
+    Altyazı videoyu yapanın yazdığı metindir; konuşma tanımanın yanlış duyduğu yerde altyazının
+    yazımı alınır. Altyazının kaçırdığı kelimeler konuşma dökümünden korunur. (yeni döküm, düzeltme sayısı)"""
+    if not transcript or not captions:
+        return transcript, 0
+    a = [(w, si) for si, seg in enumerate(transcript) for w in seg["text"].split()]
+    b, ok = [], []
+    for c in captions:
+        for n, line in enumerate(c["lines"]):
+            ws = line.split()
+            b += ws
+            ok += [bool((c.get("trust") or [True] * len(c["lines"]))[n])] * len(ws)
+    if not a or not b or len(a) * len(b) > 4e7:
+        return transcript, 0
+    na, nb = [_norm1(w) for w, _ in a], [_norm1(w) for w in b]
+    sm = difflib.SequenceMatcher(None, na, nb, autojunk=False)
+    out, fixed = [[] for _ in transcript], 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        la, lb = i2 - i1, j2 - j1
+        if tag == "equal":                                           # aynı kelime: güvenilir okunduysa altyazının yazımı
+            for k in range(la):
+                out[a[i1 + k][1]].append(b[j1 + k] if ok[j1 + k] else a[i1 + k][0])
+        elif tag == "insert":
+            # Konuşma tanımanın atladığı kelimeler: iki eşleşme arasında, kısa ve net okunmuşsa eklenir
+            if 0 < i1 < len(a) and lb <= 4 and all(ok[j1:j2]):
+                out[a[i1 - 1][1]] += b[j1:j2]
+                fixed += 1
+        elif tag == "replace" and la == lb <= 3 and all(ok[j1:j2]):   # kısa ve net: altyazı konuşmanın yerine geçer
+            for k in range(la):
+                out[a[i1 + k][1]].append(b[j1 + k])
+            fixed += 1
+        elif tag == "replace" and la * lb <= 250000:                # farklı yazılmış bölge: kelime kelime eşle
+            last_seg = a[i1][1]
+            ops = _align_words(na[i1:i2], nb[j1:j2])
+            for n, (kind, x, y) in enumerate(ops):
+                if kind == "pair":                                  # aynı kelimenin iki yazımı
+                    last_seg = a[i1 + x][1]
+                    use = ok[j1 + y]                                # altyazı net okunduysa onu al, yoksa konuşma kalır
+                    out[last_seg].append(b[j1 + y] if use else a[i1 + x][0])
+                    fixed += use and _norm1(a[i1 + x][0]) != _norm1(b[j1 + y])
+                elif kind == "asr":                                 # altyazıda yok: konuşma dökümü kalır
+                    last_seg = a[i1 + x][1]
+                    out[last_seg].append(a[i1 + x][0])
+                else:
+                    # Yalnızca altyazıda olan kelime: konuşma tanıma atlamış olabilir. Kısa, net okunmuş ve
+                    # iki eşleşmenin arasındaysa eklenir; baştaki/sondaki uzun yazılar (başlık gibi) eklenmez.
+                    lo = n
+                    while lo > 0 and ops[lo - 1][0] == "cap":
+                        lo -= 1
+                    hi = n
+                    while hi + 1 < len(ops) and ops[hi + 1][0] == "cap":
+                        hi += 1
+                    if ok[j1 + y] and hi - lo < 4 and lo > 0 and hi + 1 < len(ops):
+                        out[last_seg].append(b[j1 + y])
+        elif tag in ("delete", "replace"):                          # altyazıda yok: konuşma dökümü kalır
+            for k in range(i1, i2):
+                out[a[k][1]].append(a[k][0])
+    return [dict(seg, text=" ".join(out[i]) or seg["text"]) for i, seg in enumerate(transcript)], fixed
+
+
+def build_blocks(kept, transcript, screen, motions, fps, duration):
+    """Dökümü zaman aralıklarına böler: her aralıkta o andaki konuşma, ekranda yeni beliren yazılar,
+    ilgili kareler ve görüntünün ne kadar hareketli olduğu bulunur."""
+    blocks = []
+    for k in kept:
+        gap = k["t0"] - blocks[-1]["start"] if blocks else 0
+        if not blocks or gap >= 6 or (k["reason"] == "scene" and gap >= 2):
+            blocks.append({"start": k["t0"], "frames": [k["n"]]})
+        else:
+            blocks[-1]["frames"].append(k["n"])
+    for i, b in enumerate(blocks):
+        b["end"] = blocks[i + 1]["start"] if i + 1 < len(blocks) else max(duration, b["start"])
+        lo = -1 if i == 0 else b["start"]
+        b["speech"] = []
+        lines, more = [], 0
+        for x in screen or []:
+            if lo <= x["t"] < b["end"]:
+                lines += x["lines"]
+                more += x.get("more", 0)
+        b["screen"], b["more"] = lines[:14], more + max(0, len(lines) - 14)
+        seg = motions[int(b["start"] * fps) + 1: int(b["end"] * fps)]
+        moving = sum(x >= 0.01 for x in seg) / len(seg) if seg else 0      # kesmeler değil, süregelen hareket
+        b["motion"] = "sürekli hareket (kamera ya da sayfa kaydırma)" if moving >= 0.5 else ""
+    # Konuşma bölümleri uzun olabilir: kelimeleri bölümün süresine yayıp ait oldukları aralığa koy
+    for seg in transcript:
+        words = seg["text"].split()
+        for n, w in enumerate(words):
+            tw = seg["start"] + (seg["end"] - seg["start"]) * n / max(len(words), 1)
+            target = next((b for b in blocks if b["start"] <= tw < b["end"]), blocks[-1] if tw >= blocks[-1]["start"] else blocks[0])
+            target["speech"].append(w)
+    for b in blocks:
+        b["speech"] = " ".join(b["speech"])
+    return blocks
 
 
 def frames_for_new_text(path, scan, step, kept, revisits, tmp, langs, detector, have_tess, limit=15):
@@ -531,8 +847,8 @@ def frames_for_new_text(path, scan, step, kept, revisits, tmp, langs, detector, 
         r["obj"] = kept[r["of"]]
     for n, t in enumerate(times):
         f = tmp / "raw" / f"extra_{n:03d}.jpg"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t + min(0.3, step / 2):.2f}", "-i", path, "-frames:v", "1",
-                        "-vf", FRAME_SCALE.format(1280), "-q:v", "2", str(f)], check=True)
+        ff(["ffmpeg", "-v", "error", "-y", "-ss", f"{t + min(0.3, step / 2):.2f}", "-i", path, "-frames:v", "1",
+            "-vf", FRAME_SCALE.format(1280), "-q:v", "2", str(f)])
         if f.exists():
             kept.append({"t": t + min(0.3, step / 2), "t0": t, "reason": "text", "score": 1.0, "settled": True, "raw": f,
                          "ocr": ocr_frame(f, langs, detector, have_tess)})
@@ -604,8 +920,7 @@ def classify_text(kept, transcript):
 
 # ---- 3) konuşma -----------------------------------------------------------
 def extract_audio(path, wav):
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000",
-                    "-c:a", "pcm_s16le", str(wav)], check=True)
+    ff(["ffmpeg", "-v", "error", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)])
 
 
 def asr_faster_whisper(wav, model, lang, device="cpu"):
@@ -714,7 +1029,7 @@ def font(size):
     return ImageFont.load_default()
 
 
-def make_sheets(kept, outdir, cols=3, tile=384, per_sheet=9):
+def make_sheets(kept, outdir, cols=3, tile=384, per_sheet=9, prefix="sheet"):
     """Kareleri zaman damgalı kontak baskılara dizer: aynı içerik, çok daha az görsel token."""
     outdir.mkdir(parents=True, exist_ok=True)
     sheets, fnt = [], font(22)
@@ -732,11 +1047,11 @@ def make_sheets(kept, outdir, cols=3, tile=384, per_sheet=9):
         for n, (k, im) in enumerate(zip(group, ims)):
             x, y = (n % cols) * tile, (n // cols) * th
             sheet.paste(im, (x + (tile - im.width) // 2, y))
-            label = f"#{k['n']}  {mmss(k['t0'])}"
+            label = k.get("label") or f"#{k['n']}  {mmss(k['t0'])}"
             box = draw.textbbox((x + 6, y + 6), label, font=fnt)
             draw.rectangle((box[0] - 4, box[1] - 4, box[2] + 4, box[3] + 4), fill="black")
             draw.text((x + 6, y + 6), label, fill="yellow", font=fnt)
-        p = outdir / f"sheet_{len(sheets) + 1:02d}.jpg"
+        p = outdir / f"{prefix}_{len(sheets) + 1:02d}.jpg"
         sheet.save(p, quality=85)
         sheets.append(p)
     return sheets
@@ -821,77 +1136,155 @@ def build_pack(out, meta, kept, revisits, transcript, sheets, timings, screen_te
     (out / "pack.json").write_text(json.dumps(js, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_transcript(out, meta, kept, transcript, sheets, screen_text=None, captions=None, comments=None):
-    """Tek dosyada, modele verilmeye hazır döküm: açıklama + konuşma + ekrandaki yazılar + altyazılar + kareler.
-    Özet değildir; videodaki bilginin tamamını metne çevirmeyi hedefler."""
-    full = screen_text is not None
-    if not full:                                    # tarama kapalıysa yalnızca seçilen karelerdeki yazılar
-        screen_text = [{"t": k["t0"], "lines": k["text_new"]} for k in kept if k["text_new"]]
-        captions = [{"t": k["t0"], "lines": k["text_caption"]} for k in kept if k["text_caption"]]
+def doc_head(meta):
+    """Dökümün başı: başlık, kaynak bilgileri ve açıklama."""
     L = [f"# {meta['title']}", ""]
     L.append(f"- Kaynak: {meta.get('webpage_url') or meta['source']}")
     if meta.get("uploader"):
         L.append(f"- Hesap: {meta['uploader']}")
     if meta.get("upload_date"):
         L.append(f"- Yayın tarihi: {meta['upload_date']}")
-    L.append(f"- Süre: {mmss(meta['duration'])}")
+    if meta.get("duration"):
+        L.append(f"- Süre: {mmss(meta['duration'])}")
+    else:
+        L.append(f"- Tür: görsel gönderi ({meta['frames']} görsel)")
     st = meta.get("stats") or {}
     if st:
         names = (("plays", "izlenme"), ("likes", "beğeni"), ("comments", "yorum"))
         L.append("- Etkileşim: " + " · ".join(f"{int(st[k]):,} {tr}".replace(",", ".") for k, tr in names if k in st))
-    L.append(f"- İşlenme: {meta['created']} · konuşma: {meta['asr']}" + (f" · dil: {meta['language']}" if meta.get("language") else ""))
+    L.append(f"- İşlenme: {meta['created']}" + (f" · konuşma: {meta['asr']}" if meta.get("duration") else "")
+             + (f" · dil: {meta['language']}" if meta.get("language") else ""))
     L += ["", "## Açıklama", ""]
     L += [meta["description"].strip() if meta.get("description", "").strip() else "_Açıklama yok._", ""]
+    return L
 
-    L += ["## Konuşma", ""]
-    if transcript:
-        L += [f"[{mmss(s['start'])}] {s['text']}" for s in transcript]
-    else:
-        L.append("_Konuşma bulunamadı ya da çözülemedi._")
-    L.append("")
 
-    L += ["## Ekrandaki yazılar", ""]
-    if screen_text:
-        L += [f"- [{mmss(x['t'])}] " + " / ".join(x["lines"]) for x in screen_text]
-        L += ["", "_Her yazı ilk göründüğü anda bir kez listelendi. Konuşmanın altyazıları aşağıda ayrı verildi. "
-                  "Yazılar otomatik okundu; hatalı olabilir._"]
-    else:
-        L.append("_Konuşmanın altyazısı dışında ekran yazısı bulunamadı._")
-    L.append("")
+def comment_section(comments):
+    if not comments:
+        return []
+    def line(c, indent=""):
+        who = "gönderi sahibi" if c.get("by_owner") else (f"@{c['user']}" if c.get("user") else "")
+        likes = f"{c['likes']} beğeni" if c.get("likes") else ""
+        tag = ", ".join(x for x in (who, likes) if x)
+        return f"{indent}- " + (f"({tag}) " if tag else "") + " ".join(str(c["text"]).split())
+    L = [f"## Yorumlar ({len(comments)})", "",
+         "_Gönderinin altındaki yorumlar; içeriğin kendisi değildir, izleyenlerin yazdıklarıdır._", ""]
+    for c in comments:
+        L.append(line(c))
+        L += [line(r, "  ") for r in (c.get("replies") or []) if isinstance(r, dict) and str(r.get("text", "")).strip()]
+    return L + [""]
 
-    if captions:
-        L += ["## Ekrandaki altyazılar" if full else "## Ekrandaki altyazılardan örnekler", "",
-              "_Videoyu yapanın ekrana yazdığı altyazılar. Konuşma dökümüyle çelişen bir kelime varsa altyazı doğrudur._", ""]
-        L += [f"[{mmss(x['t'])}] " + " / ".join(x["lines"]) for x in captions] + [""]
 
-    if comments:
-        def line(c, indent=""):
-            who = "video sahibi" if c.get("by_owner") else (f"@{c['user']}" if c.get("user") else "")
-            likes = f"{c['likes']} beğeni" if c.get("likes") else ""
-            tag = ", ".join(x for x in (who, likes) if x)
-            text = " ".join(str(c["text"]).split())
-            return f"{indent}- " + (f"({tag}) " if tag else "") + text
-        L += [f"## Yorumlar ({len(comments)})", "",
-              "_Gönderinin altındaki yorumlar; videonun içeriği değildir, izleyenlerin yazdıklarıdır._", ""]
-        for c in comments:
-            L.append(line(c))
-            L += [line(r, "  ") for r in (c.get("replies") or []) if isinstance(r, dict) and str(r.get("text", "")).strip()]
-        L.append("")
+def ocr_engines(args):
+    """(metin kutusu dedektörü, tesseract var mı, görünen ad) döndürür."""
+    if args.no_ocr:
+        return None, False, "kapalı"
+    have_tess = bool(shutil.which("tesseract"))
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        detector = RapidOCR()
+    except Exception:
+        detector = None
+    if detector is None and not have_tess:
+        log("uyarı: OCR motoru yok (pip install rapidocr-onnxruntime ve/veya tesseract kurun).")
+        return None, False, "yok"
+    return detector, have_tess, " + ".join(x for x in ["metin kutusu tespiti" if detector else "", "tesseract" if have_tess else ""] if x)
 
+
+def prepare_images(paths, out, tmp, args, engines):
+    """Görselleri pakete alır ve üstlerindeki yazıları okur."""
+    detector, have_tess, name = engines
+    items = []
+    for p in paths:
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception as e:
+            log(f"uyarı: görsel açılamadı ({Path(p).name}): {e}")
+            continue
+        n = len(items) + 1
+        full = im.copy()
+        full.thumbnail((1600, 1600))
+        fp = Path(tmp) / f"img_full_{n:03d}.jpg"
+        full.save(fp, quality=92)
+        lines = ocr_frame(fp, args.ocr_lang, detector, have_tess) if name not in ("kapalı", "yok") else []
+        im.thumbnail((args.frame_size, args.frame_size))
+        f = out / "frames" / f"g{n:03d}.jpg"
+        im.save(f, quality=85)
+        items.append({"n": n, "t": 0.0, "t0": 0.0, "reason": "image", "file": f, "label": f"Görsel {n}",
+                      "ocr": lines, "text": [ln["text"] for ln in lines]})
+    return items
+
+
+def run_images(args, images, src_meta, comments, out, tmp, say, t_all):
+    """Videosuz gönderi (tek ya da çoklu görsel): açıklama + görsellerdeki yazılar + görseller."""
+    say("Görsellerdeki yazılar okunuyor")
+    engines = ocr_engines(args)
+    items = prepare_images(images, out, tmp, args, engines)
+    if not items:
+        raise VidnoteError("Görseller açılamadı.")
+    sheets = make_sheets(items, out / "sheets")
+    meta = dict(src_meta, source=args.source_label or args.input, duration=0, frames=len(items), kind="images",
+                asr="yok", ocr=engines[2], language=None, created=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    L = doc_head(meta)
+    L += ["## Görsellerdeki yazılar", ""]
+    L += [f"- {k['label']}: " + (" / ".join(k["text"]) if k["text"] else "_yazı yok_") for k in items]
+    L += ["", "_Yazılar otomatik okundu; hatalı olabilir. Görselde ne olduğu yalnızca görselin kendisinden anlaşılır._", ""]
+    L += comment_section(comments)
+    names = ", ".join(f"`sheets/{p.name}`" for p in sheets)
+    L += ["## Görseller", "", f"{len(items)} görsel; numaralarıyla şu dosyalarda: {names}. Tek tek: `frames/` klasörü. "
+          "Görüntüde ne olduğunu anlamak için bu dosyaları da modele verin.", ""]
+    tpath = out / "transkript.md"
+    tpath.write_text("\n".join(L), encoding="utf-8")
+    timings = {"toplam": round(time.time() - t_all, 2)}
+    (out / "pack.json").write_text(json.dumps({
+        "meta": meta, "timings_sec": timings, "comments": comments or [],
+        "images": [{"n": k["n"], "file": f"frames/{k['file'].name}", "text": k["text"]} for k in items]},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"bitti: {tpath}  ({len(items)} görsel, {timings['toplam']} sn)")
+    return {"out": out, "transcript": tpath, "sheets": sheets, "meta": meta, "timings": timings}
+
+
+def write_transcript(out, meta, kept, blocks, sheets, comments=None, extra_images=None, notes=None, fixed=0):
+    """Tek dosyada, modele verilmeye hazır döküm. Özet değildir; videodaki bilgiyi tekrarsız bir zaman akışına dizer."""
+    L = doc_head(meta)
+    L += ["## Zaman akışı", "",
+          "_Her bölüm bir zaman aralığıdır: o aralıktaki konuşma, ekranda ilk kez görünen yazılar ve görüntünün hareketi."
+          + (f" Konuşma metni ekrandaki altyazılarla karşılaştırılıp {fixed} yerde düzeltildi." if fixed else "")
+          + " Ekran yazıları otomatik okundu; hatalı olabilir._", ""]
+    for b in blocks:
+        fr = b["frames"]
+        L += [f"### {mmss(b['start'])}–{mmss(b['end'])} · Kare {fr[0]}" + (f"–{fr[-1]}" if len(fr) > 1 else ""), ""]
+        if b["speech"]:
+            L += [f"**Konuşma:** {b['speech']}", ""]
+        if b["screen"]:
+            L += ["**Ekranda yazan:** " + " / ".join(b["screen"])
+                  + (f" _(+{b['more']} satır daha; karelerde)_" if b["more"] else ""), ""]
+        if b["motion"]:
+            L += [f"**Görüntü:** {b['motion']}", ""]
+        if not (b["speech"] or b["screen"] or b["motion"]):
+            L += ["_Yeni görüntü; konuşma ve yazı yok._", ""]
+    if not meta.get("has_speech"):
+        L += ["_Bu videoda konuşma bulunamadı ya da çözülemedi._", ""]
+    L += comment_section(comments)
+    if extra_images:
+        L += ["## Gönderideki görseller", "", "_Videonun yanında paylaşılan görseller ve üstlerindeki yazılar._", ""]
+        L += [f"- {k['label']}: " + (" / ".join(k["text"]) if k["text"] else "_yazı yok_") for k in extra_images] + [""]
+    for n in notes or []:
+        L += [f"_{n}_", ""]
     L += ["## Görseller", ""]
     if sheets:
         names = ", ".join(f"`sheets/{p.name}`" for p in sheets)
-        L += [f"{len(kept)} kare seçildi; zaman damgalarıyla şu dosyalarda: {names}. Görüntüde ne olduğunu anlamak için bu dosyaları da modele verin.", ""]
-    L += ["Karelerin zamanı: " + ", ".join(mmss(k["t0"]) for k in kept), ""]
+        L += [f"{len(kept)} kare seçildi; numaraları ve zaman damgalarıyla şu dosyalarda: {names}. "
+              "Görüntüde ne olduğunu anlamak için bu dosyaları da modele verin.", ""]
+    L += ["Karelerin zamanı: " + ", ".join(f"{k['n']}={mmss(k['t0'])}" for k in kept), ""]
     path = out / "transkript.md"
     path.write_text("\n".join(L), encoding="utf-8")
     return path
 
 
-# ---- ana akış -------------------------------------------------------------
 def build_parser():
     ap = argparse.ArgumentParser(description="Videoyu yapay zekânın okuyabileceği bir döküme çevirir.")
-    ap.add_argument("input", help="video dosyası, link ya da VidNote paketi (.zip)")
+    ap.add_argument("input", help="video ya da görsel dosyası, link ya da VidNote paketi (.zip)")
     ap.add_argument("-o", "--out", help="çıktı klasörü (varsayılan: <video adı>_pack)")
     ap.add_argument("--max-frames", type=int, default=60, help="en fazla kare (varsayılan 60)")
     ap.add_argument("--frame-size", type=int, default=768, help="pakete giren karenin uzun kenarı (px)")
@@ -909,6 +1302,10 @@ def build_parser():
     ap.add_argument("--cookies-from-browser", help="giriş isteyen siteler için tarayıcı adı (chrome, firefox)")
     ap.add_argument("--cookies", help="giriş isteyen siteler için cookies.txt dosyası (sunucuda tarayıcı yoksa)")
     ap.add_argument("--whisper-device", default="cpu", choices=["cpu", "cuda", "auto"], help="faster-whisper için aygıt")
+    ap.add_argument("--max-height", type=int, default=720,
+                    help="indirilecek videonun en fazla yüksekliği (varsayılan 720; 360 veri ve disk kazandırır, küçük yazılar okunmayabilir)")
+    ap.add_argument("--no-site-captions", action="store_true",
+                    help="YouTube'un hazır altyazısını kullanma; konuşmayı her zaman baştan çöz")
     ap.add_argument("--comments", type=int, default=0,
                     help="linkten işlerken en fazla bu kadar yorum da al (varsayılan 0 = alma)")
     ap.add_argument("--title", help="başlığı elle ver")
@@ -919,18 +1316,35 @@ def build_parser():
 
 def run(args, progress=None):
     """Bir videoyu işler; çıktı klasörünü ve özet bilgileri döndürür.
-    progress: her aşamada kısa bir durum metniyle çağrılan işlev (arayüz için)."""
-    say = progress or (lambda msg: None)
+    progress: her aşamada (durum metni, varsa 0-1 arası oran) ile çağrılan işlev (arayüz için)."""
+    say = progress or (lambda msg, fraction=None: None)
     timings, t_all = {}, time.time()
     tmp = Path(tempfile.mkdtemp(prefix="vidnote_"))
     try:
         t = time.time()
         src_meta = {"title": "", "description": "", "uploader": "", "upload_date": "", "webpage_url": "", "site": "", "stats": {}}
-        comments = []
+        comments, images, notes = [], [], []
         if re.match(r"https?://", args.input):
-            say("Video indiriliyor")
-            log("indiriliyor…")
-            src, src_meta, comments = fetch_url(args.input, tmp, args.cookies_from_browser, args.cookies, args.comments)
+            url = args.input
+            insta = bool(re.search(r"//(www\.)?instagram\.com/", url))
+            src = None
+            if not (insta and "/p/" in url):               # /p/ gönderileri görsel olabilir; onlar aşağıda
+                say("Video indiriliyor")
+                log("indiriliyor…")
+                try:
+                    src, src_meta, comments = fetch_url(url, tmp, args.cookies_from_browser, args.cookies, args.comments, say,
+                                                         args.max_height, not args.no_site_captions, args.lang)
+                except VidnoteError as e:
+                    if not (insta and "no video in this post" in str(e).lower()):
+                        raise
+            if src is None:                                 # görsel ya da çoklu Instagram gönderisi
+                say("Gönderi indiriliyor")
+                log("gönderi indiriliyor (gallery-dl)…")
+                images, videos, src_meta = fetch_instagram_post(url, tmp, args.cookies_from_browser, args.cookies)
+                src = str(videos[0]) if videos else None
+                if len(videos) > 1:
+                    notes.append(f"Gönderide {len(videos)} video var; yalnızca ilki işlendi.")
+                log(f"gönderi: {len(images)} görsel, {len(videos)} video")
             default_out = re.sub(r"[^\w\-]+", "_", src_meta["title"])[:60].strip("_") or "video"
         else:
             src = args.input
@@ -939,8 +1353,10 @@ def run(args, progress=None):
             default_out = Path(src).stem
             if Path(src).suffix.lower() == ".zip":          # eklentinin ürettiği paket
                 say("Paket açılıyor")
-                src, src_meta, comments = open_package(src, tmp)
-                log(f"paket: {len(comments)} yorum, açıklama {len(src_meta['description'])} karakter")
+                src, images, src_meta, comments = open_package(src, tmp)
+                log(f"paket: {len(images)} görsel, {len(comments)} yorum, açıklama {len(src_meta['description'])} karakter")
+            elif Path(src).suffix.lower() in IMAGE_SUFFIXES:   # tek görsel (ekran görüntüsü de olabilir)
+                images, src, src_meta["title"] = [Path(src)], None, Path(src).stem
             else:
                 src_meta["title"] = Path(src).stem
         if args.title:
@@ -952,65 +1368,60 @@ def run(args, progress=None):
             shutil.rmtree(out)
         (out / "frames").mkdir(parents=True)
         timings["girdi"] = round(time.time() - t, 2)
+        if src is None:
+            return run_images(args, images, src_meta, comments, out, tmp, say, t_all)
 
         info = probe(src)
         dur = info["duration"]
         fps = 4 if dur <= 600 else (2 if dur <= 3600 else 1)
         log(f"video: {mmss(dur)}, {info['width']}x{info['height']}")
 
-        say("Kareler seçiliyor")
-        t = time.time()
-        kept, revisits, analyzed = select_frames(src, fps, dur, args.max_frames)
-        raw = extract_frames(src, fps, kept, tmp / "raw")
-        for k, f in zip(kept, raw):
-            k["raw"] = f
-        timings["kare_secimi"] = round(time.time() - t, 2)
-        log(f"kare: {analyzed} tarandı → {len(kept)} seçildi, {len(revisits)} tekrar atlandı")
+        engines = ocr_engines(args)
+        detector, have_tess, ocr_name = engines
+        scanning = ocr_name not in ("kapalı", "yok") and args.text_scan > 0
 
-        say("Konuşma yazıya dökülüyor")
+        def visual():
+            """Görüntü tarafı: kare seçimi ve yazı okuma. Konuşma çözülürken arka planda çalışır."""
+            t0 = time.time()
+            kept, revisits, analyzed, motions = select_frames(src, fps, dur, args.max_frames)
+            for k, f in zip(kept, extract_frames(src, fps, kept, tmp / "raw")):
+                k["raw"] = f
+            timings["kare_secimi"] = round(time.time() - t0, 2)
+            log(f"kare: {analyzed} tarandı → {len(kept)} seçildi, {len(revisits)} tekrar atlandı")
+            t0 = time.time()
+            for k, lines in zip(kept, ocr_many([k["raw"] for k in kept], args.ocr_lang, engines)):
+                k["ocr"] = lines
+            scan, step = scan_text(src, dur, args.text_scan, tmp, args.ocr_lang, engines) if scanning else (None, 0)
+            timings["yazi_okuma"] = round(time.time() - t0, 2)
+            return kept, revisits, analyzed, motions, scan, step
+
+        say("Kareler seçiliyor, yazılar okunuyor, konuşma yazıya dökülüyor")
+        pool = ThreadPoolExecutor(1)
+        vis = pool.submit(visual)
         t = time.time()
         transcript, language, asr_name = [], None, "ses yok"
-        if info["has_audio"]:
+        ready = src_meta.pop("ready_transcript", None)
+        if ready:                                           # sitenin hazır altyazısı: konuşmayı çözmeye gerek yok
+            transcript, language, asr_name = ready
+        elif info["has_audio"]:
             wav = tmp / "audio.wav"
             extract_audio(src, wav)
             transcript, language, asr_name = transcribe(wav, args)
         timings["konusma"] = round(time.time() - t, 2)
-        log(f"konuşma: {len(transcript)} bölüm ({asr_name})")
-
+        log(f"konuşma: {len(transcript)} bölüm ({asr_name}, {timings['konusma']} sn)")
         say("Ekrandaki yazılar okunuyor")
-        t = time.time()
-        ocr_name = "kapalı"
-        if not args.no_ocr:
-            have_tess = bool(shutil.which("tesseract"))
-            try:
-                from rapidocr_onnxruntime import RapidOCR
-                detector = RapidOCR()
-            except Exception:
-                detector = None
-            if detector is None and not have_tess:
-                log("uyarı: OCR motoru yok (pip install rapidocr-onnxruntime ve/veya tesseract kurun).")
-                ocr_name = "yok"
-            else:
-                ocr_name = " + ".join(x for x in ["metin kutusu tespiti" if detector else "", "tesseract" if have_tess else ""] if x)
-                for k in kept:
-                    k["ocr"] = ocr_frame(k["raw"], args.ocr_lang, detector, have_tess)
-        classify_text(kept, transcript)
-        timings["ocr"] = round(time.time() - t, 2)
+        kept, revisits, analyzed, motions, scan, step = vis.result()
+        pool.shutdown()
 
-        # Ekrandaki yazıların tamamı: düzenli aralıklı tarama
-        screen_text, captions, added = None, None, 0
-        if ocr_name not in ("kapalı", "yok") and args.text_scan > 0:
-            say("Ekrandaki tüm yazılar taranıyor")
-            t = time.time()
-            scan, step = scan_text(src, dur, args.text_scan, tmp, args.ocr_lang, detector, have_tess)
+        t = time.time()
+        classify_text(kept, transcript)
+        added = 0
+        if scan is not None:
             classify_text(scan, transcript)
             added = frames_for_new_text(src, scan, step, kept, revisits, tmp, args.ocr_lang, detector, have_tess)
             if added:
                 classify_text(kept, transcript)
-            screen_text, captions = text_streams(scan, kept)
-            timings["yazi_taramasi"] = round(time.time() - t, 2)
-            log(f"yazı taraması: {len(scan)} örnek ({step:.1f} sn arayla) → {len(screen_text)} ekran yazısı, "
-                f"{len(captions)} altyazı, {added} ek kare")
+            log(f"yazı taraması: {len(scan)} örnek ({step:.1f} sn arayla), {added} ek kare")
 
         # Tek yeniliği konuşmanın altyazısı olan kareleri ele
         pruned = 0
@@ -1026,6 +1437,11 @@ def run(args, progress=None):
             classify_text(kept, transcript)
 
         say("Döküm hazırlanıyor")
+        screen_text, captions = text_streams(scan, kept)
+        raw_transcript = transcript
+        transcript, fixed = fuse_speech(transcript, captions)       # altyazıyla düzeltilmiş konuşma
+        if fixed:
+            log(f"konuşma, ekrandaki altyazılarla {fixed} yerde düzeltildi")
         for n, k in enumerate(kept, 1):
             k["n"] = n
             im = Image.open(k["raw"]).convert("RGB")
@@ -1033,13 +1449,24 @@ def run(args, progress=None):
             k["file"] = out / "frames" / f"f{n:03d}_{mmss(k['t0']).replace(':', '-')}.jpg"
             im.save(k["file"], quality=82)
         sheets = make_sheets(kept, out / "sheets")
+        extra = []
+        if images:                                      # videonun yanında gelen görseller
+            say("Gönderideki görseller okunuyor")
+            extra = prepare_images(images, out, tmp, args, engines)
+            sheets += make_sheets(extra, out / "sheets", prefix="gorsel")
 
         timings["toplam"] = round(time.time() - t_all, 2)
         meta = dict(src_meta, source=args.source_label or args.input, duration=round(dur, 2), width=info["width"], height=info["height"],
                     fps=fps, analyzed=analyzed, frames=len(kept), pruned_captions=pruned, asr=asr_name, ocr=ocr_name,
-                    language=language, created=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-        build_pack(out, meta, kept, revisits, transcript, sheets, timings, screen_text, captions, comments)
-        tpath = write_transcript(out, meta, kept, transcript, sheets, screen_text, captions, comments)
+                    language=language, has_speech=bool(transcript), speech_fixes=fixed,
+                    created=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        blocks = build_blocks(kept, transcript, screen_text, motions, fps, dur)
+        build_pack(out, meta, kept, revisits, raw_transcript, sheets, timings, screen_text, captions, comments)
+        js = json.loads((out / "pack.json").read_text(encoding="utf-8"))     # ham ve düzeltilmiş hâli birlikte sakla
+        js["transcript_fused"] = [{"start": round(x["start"], 2), "end": round(x["end"], 2), "text": x["text"]} for x in transcript]
+        js["timeline"] = blocks
+        (out / "pack.json").write_text(json.dumps(js, ensure_ascii=False, indent=2), encoding="utf-8")
+        tpath = write_transcript(out, meta, kept, blocks, sheets, comments, extra, notes, fixed)
         tk = meta["tokens"]
         log(f"bitti: {tpath}  ({timings['toplam']} sn)")
         log(f"yaklaşık token: metin {tk['text']} · kareler {tk['frames']} · kontak baskı {tk['sheets']}")

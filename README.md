@@ -3,21 +3,23 @@
 Bir videodaki bilginin tamamını, yapay zekânın değerlendirebileceği metne ve önemli karelere çevirir.
 Özet üretmez; özetleme ya da başka bir işleme için dökümü istediğin modele verirsin.
 
-Bir videodan çıkanlar:
+Bir videodan çıkan döküm (`transkript.md`):
 
-| Bölüm | Kaynağı |
+| Bölüm | İçeriği |
 |---|---|
 | Açıklama | Gönderinin altındaki metin (linkten işlenirse) |
-| Konuşma | Sesin zaman damgalı yazıya dökümü |
-| Ekrandaki yazılar | Başlık, liste, fiyat, kapak yazısı gibi gömülü metinler; her biri bir kez |
-| Ekrandaki altyazılar | Videoyu yapanın ekrana yazdığı altyazıların akışı |
-| Kareler | Görüntünün değiştiği anlardan seçilmiş, zaman damgalı kareler |
+| Zaman akışı | Videonun zaman aralıklarına bölünmüş hâli. Her aralıkta: o andaki konuşma, ekranda ilk kez görünen yazılar, ilgili kare numaraları ve görüntü sürekli hareket ediyorsa bunun notu |
 | Yorumlar | Gönderinin altındaki yorumlar (tarayıcı eklentisiyle ya da ayar açıksa linkten) |
+| Görseller | Seçilen karelerin numaralı, zaman damgalı sayfaları |
+
+Aynı bilgi iki kez yazılmaz. Konuşma, ekrandaki altyazılarla kelime kelime karşılaştırılır: altyazı net okunmuşsa
+onun yazımı alınır ("Cloud'un Houtus'u" yerine "Claude'un How-to'su"), okunaksızsa konuşma dökümü kalır.
+Ham konuşma dökümü, altyazı akışı ve tüm ekran yazıları `pack.json` içinde ayrıca saklanır.
 
 ## Kurulum
 
 ```
-git clone https://github.com/histekli/vidnote.git && cd vidnote
+unzip vidnote.zip && cd vidnote
 ./kur.sh
 ```
 
@@ -37,7 +39,9 @@ Mac'te Instagram linkleri için en kolay yol `ayarlar.env` içinde `COOKIES_BROW
 
 ```
 vidnote "https://www.youtube.com/watch?v=..."     # dökümü ekrana yazar ve kaydeder
+vidnote "https://www.instagram.com/p/..."          # görsel ya da çoklu görsel gönderi: açıklama + görsellerdeki yazılar
 vidnote video.mp4 --description "gönderi metni"    # dosyadan; açıklamayı elle ver
+vidnote ekran_goruntusu.png                        # tek görsel de olur
 vidnote instagram_hesap_KOD.zip                    # eklentinin ürettiği paket (video + açıklama + yorumlar)
 vidnote "<link>" --json                            # başka bir programın okuması için
 vidnote "<link>" --quiet                           # yalnızca döküm dosyasının yolunu yazar
@@ -123,6 +127,32 @@ Beceri, Hermes'e bir video linki geldiğinde terminalde `vidnote "<link>" --json
 `TELEGRAM_USERS` satırına yazmadan kimseye cevap vermez. Hermes zaten Telegram'a bağlıysa buna gerek yok;
 Hermes'in bot anahtarını buraya yazma, ikisi çakışır.
 
+## Hız ve veri kullanımı
+
+- **YouTube'da hazır altyazı:** videonun altyazısı varsa (elle yazılmış ya da otomatik) o kullanılır; ses indirilmez ve
+  konuşma baştan çözülmez. Uzun videolarda en büyük kazanç budur. Kapatmak için `SITE_CAPTIONS=0`.
+- **Çözünürlük:** `MAX_HEIGHT=360` indirilen veriyi ve disk kullanımını belirgin azaltır; karşılığında ekrandaki küçük
+  yazılar okunmayabilir. Video işlem bitince silinir, diskte yalnızca seçilen kareler kalır.
+- **Yazı taraması:** en yavaş adımdır. `TEXT_SCAN=2` yarıya indirir, `TEXT_SCAN=0` kapatır (altyazıyla konuşma
+  düzeltmesi yalnızca seçilen karelerle yapılır).
+- Yazı okuma çekirdek sayısına göre paralel çalışır; konuşma çözme ile görüntü tarafı aynı anda yürür.
+
+Videoyu hiç indirmeden, tarayıcıda oynarken kare alıp YouTube'un altyazısını okuyan bir eklenti yolu da mümkün,
+ama henüz yazılmadı.
+
+## Görsel gönderiler
+
+Instagram'da `/p/` ile başlayan gönderiler tek görsel, çoklu görsel ya da video olabilir. Bunlar gallery-dl ile
+indirilir (video indiricisi yt-dlp görsel indirmez). Çıkan dökümde açıklama, her görselin üstündeki yazılar
+("Görsel 1: …") ve görsellerin numaralı kontak baskısı bulunur. Gönderide video da varsa ilk video normal
+biçimde işlenir, görseller "Gönderideki görseller" bölümüne eklenir.
+Görselde *ne olduğu* (yazı dışındaki içerik) metne çevrilmez; onu görsel dosyasını modele vererek alırsın.
+
+## Güncelleme
+
+Yeni paketi eski klasörün üstüne aç ve `./kur.sh` komutunu yeniden çalıştır (eksik parçaları kurar).
+`ayarlar.env` dosyan ve `~/VidNote` altındaki dökümlerin yerinde kalır.
+
 ## Instagram ve giriş isteyen siteler
 
 Instagram videoyu çoğunlukla yalnızca giriş yapmış kullanıcıya verir. Ekransız bir sunucuda giriş yapılmış
@@ -159,6 +189,8 @@ Her döküm `~/VidNote/<kimlik>/` klasöründedir: `transkript.md`, `sheets/`, `
 | `HOST`, `PORT` | Tarayıcı sayfasının adresi |
 | `COOKIES_FILE`, `COOKIES_BROWSER` | Giriş isteyen siteler için çerezler |
 | `LINK_COMMENTS` | Linkten işlerken alınacak en fazla yorum; `0` kapalı |
+| `MAX_HEIGHT` | İndirilecek videonun en fazla yüksekliği (varsayılan 720) |
+| `SITE_CAPTIONS` | YouTube'un hazır altyazısını kullan (varsayılan 1) |
 | `TELEGRAM_TOKEN`, `TELEGRAM_USERS` | İsteğe bağlı bot |
 
 ## Neler denendi, neler denenmedi
@@ -172,9 +204,17 @@ Denendi (Linux, 2 çekirdek):
 - eklenti, gerçek Chrome'da **sahte bir Instagram sitesine** karşı: verinin üç ayrı yoldan gelmesi, yorum
   sayfalama, yorum adresinin reddedilmesi, gönderi olmayan sayfa, paket indirme, VidNote'a gönderme ve dökümde yorumlar
 - gerçek bir video (2:22, Türkçe, konuşan kişi + araya giren görseller + gömülü altyazı) ve iki sentetik test videosu
+- görsel gönderiler, sentetik görsellerle: üç görselli paket, tek görsel dosyası, video + görsel karışık paket
+- indirme ilerlemesi, bilerek yavaşlatılmış yerel bir indirmeyle (yüzde ve çubuk sayfada görünüyor)
+- altyazıyla konuşma düzeltmesi ve zaman akışı: gerçek Türkçe videoda ve sentetik videolarda
 
 Denenmedi:
-- **macOS'ta hiçbir şey**: `kur.sh`'ın Mac dalı, `VidNote.command`, mlx-whisper. Kod aynı, ama Mac'te çalıştırılmadı.
+- macOS'ta geliştirme sırasında hiçbir şey çalıştırılamadı. Kullanıcı Mac'te kurup çalıştırdı: YouTube ve Instagram
+  Reels indirmesi çalıştı; kare çıkarma adımı yeni ffmpeg'in kaldırdığı bir seçenek yüzünden hata verdi ve düzeltildi.
+  Düzeltme Linux'ta (ffmpeg 6.1) denendi, Mac'teki ffmpeg sürümünde denenmedi.
+- YouTube'un hazır altyazısını alma ve yalnızca görüntü indirme (ağ yoktu; altyazı ayrıştırıcısı örnek veriyle denendi)
+- paralel yazı okumanın ve eşzamanlı çalışmanın gerçek hız kazancı (test makinesi 2 çekirdekli; Mac'te ölçülmedi)
+- gallery-dl ile gerçek Instagram'dan görsel gönderi indirme (ağ yoktu; indirilen klasörün okunması sahte veriyle denendi)
 - **eklenti gerçek Instagram'da**. Sahte site, Instagram'ın yanıtlarının 2025'te bilinen biçimlerine göre yazıldı;
   Instagram bunları sık değiştiriyor. İlk denemede çalışmazsa paket sayfasındaki "Tanı bilgisini kopyala" çıktısı
   neyin değiştiğini gösterir.
@@ -189,7 +229,12 @@ Bilinen eksikler:
 - Eşikler tek bir gerçek videoya göre ayarlandı.
 - Yazı taraması yavaş: 2:22'lik videoda 2 çekirdekte yaklaşık 90 saniye.
 - Altyazı akışı saniyede bir örneklendiği için bir saniyeden kısa kalan parçalar atlanabilir; konuşma dökümü onları kapsar.
+- Altyazıyla düzeltme kusursuz değil: altyazı yanlış okunmuş ama "net" görünmüşse hata konuşmaya taşınabilir.
+- Ekran kaydı gibi yazı dolu görüntülerde her aralık için yalnızca en büyük yazılar listelenir; geri kalanı karelerdedir.
+- Görüntüde *ne olduğu* (yazı dışındaki öğeler) metne çevrilmez; bunun için kare sayfalarını modele vermek gerekir.
 - Eklenti çoklu gönderilerde (kaydırmalı) yalnızca ilk videoyu alır; fotoğraf gönderilerini paketlemez.
+  Görsel gönderiler şimdilik yalnızca link yapıştırarak işlenir ve bu yolda yorumlar alınmaz.
+- Çoklu gönderide birden fazla video varsa yalnızca ilki işlenir.
 - Eklenti Safari ve Firefox'ta çalışmaz.
 - Konuşan kişinin farklı planları birkaç kez seçiliyor.
 - OCR süslü ya da çok küçük yazıda hata yapıyor; kıyafetteki marka yazısını da ekran yazısı sayıyor.

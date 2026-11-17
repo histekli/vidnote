@@ -34,7 +34,8 @@ import vidnote
 HERE = Path(__file__).resolve().parent
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".3gp"}
-UPLOAD_EXT = VIDEO_EXT | {".zip"}             # .zip: tarayıcı eklentisinin ürettiği VidNote paketi
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+UPLOAD_EXT = VIDEO_EXT | IMAGE_EXT | {".zip"}   # .zip: tarayıcı eklentisinin ürettiği VidNote paketi
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024      # Telegram botları en fazla 20 MB dosya indirebilir
 TG_TEXT_LIMIT = 3900                      # mesaj sınırı 4096 karakter; pay bırak
 
@@ -46,6 +47,7 @@ def load_settings():
         "COOKIES_BROWSER": "", "LANGUAGE": "", "WHISPER_MODEL": "large-v3-turbo",
         "NOTES_DIR": "~/VidNote", "HOST": "127.0.0.1", "PORT": "8765", "MAX_FRAMES": "60",
         "COOKIES_FILE": "", "WHISPER_DEVICE": "cpu", "TEXT_SCAN": "1", "LINK_COMMENTS": "0",
+        "MAX_HEIGHT": "720", "SITE_CAPTIONS": "1",
         "ASR_MODEL_DIR": "", "VAD_MODEL": "",
     }
     f = HERE / "ayarlar.env"
@@ -82,7 +84,7 @@ def new_job(source, origin, description="", chat_id=None, upload=None, lang=None
     jid = f"{datetime.datetime.now():%Y-%m-%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
     return {"id": jid, "source": source, "origin": origin, "description": description, "chat_id": chat_id,
             "upload": str(upload) if upload else None, "status": "queued", "stage": "Sırada", "error": None,
-            "title": Path(source).name if upload else source, "lang": lang}
+            "title": Path(source).name if upload else source, "lang": lang, "progress": None}
 
 
 def add_job(source, origin, description="", chat_id=None, upload=None):
@@ -99,7 +101,9 @@ def process(job):
     out = NOTES / job["id"]
     argv = [job["source"], "-o", str(out), "--max-frames", CFG["MAX_FRAMES"],
             "--whisper-model", CFG["WHISPER_MODEL"], "--whisper-device", CFG["WHISPER_DEVICE"],
-            "--text-scan", CFG["TEXT_SCAN"], "--comments", CFG["LINK_COMMENTS"]]
+            "--text-scan", CFG["TEXT_SCAN"], "--comments", CFG["LINK_COMMENTS"], "--max-height", CFG["MAX_HEIGHT"]]
+    if CFG["SITE_CAPTIONS"] in ("0", "false", "hayır", ""):
+        argv.append("--no-site-captions")
     lang = job.get("lang") or CFG["LANGUAGE"]
     if lang:
         argv += ["--lang", lang]
@@ -118,14 +122,15 @@ def process(job):
         argv += ["--title", Path(job["title"]).stem, "--source-label", job["title"]]
     args = vidnote.build_parser().parse_args(argv)
     try:
-        result = vidnote.run(args, progress=lambda m: job.update(stage=m))
+        result = vidnote.run(args, progress=lambda m, f=None: job.update(stage=m, progress=f))
     except BaseException:
         shutil.rmtree(out, ignore_errors=True)
         raise
     meta = result["meta"]
     note = {"id": job["id"], "title": meta["title"], "source": meta.get("webpage_url") or meta["source"],
             "uploader": meta.get("uploader", ""), "created": meta["created"], "duration": meta["duration"],
-            "frames": meta["frames"], "origin": job["origin"], "seconds": result["timings"]["toplam"],
+            "frames": meta["frames"], "kind": meta.get("kind", "video"), "origin": job["origin"],
+            "seconds": result["timings"]["toplam"],
             "sheets": [p.name for p in result["sheets"]]}
     (out / "job.json").write_text(json.dumps(note, ensure_ascii=False, indent=2), encoding="utf-8")
     return out, note
@@ -218,7 +223,7 @@ def page():
 @app.get("/api/status")
 def api_status():
     with lock:
-        active = [{k: j[k] for k in ("id", "title", "status", "stage", "error", "origin")}
+        active = [{k: j[k] for k in ("id", "title", "status", "stage", "error", "origin", "progress")}
                   for j in jobs.values() if j["status"] in ("queued", "running", "error")]
     return jsonify(active=active, telegram=bool(CFG["TELEGRAM_TOKEN"]), notes_dir=str(NOTES))
 
@@ -229,7 +234,7 @@ def api_new_job():
         f = request.files["file"]
         name = Path(f.filename or "video.mp4").name
         if Path(name).suffix.lower() not in UPLOAD_EXT:
-            return jsonify(error="Bu dosya türü desteklenmiyor. Video (mp4, mov, mkv, webm) ya da VidNote paketi (.zip) seç."), 400
+            return jsonify(error="Bu dosya türü desteklenmiyor. Video, görsel (jpg, png, webp) ya da VidNote paketi (.zip) seç."), 400
         INBOX.mkdir(parents=True, exist_ok=True)
         dest = INBOX / f"{uuid.uuid4().hex[:8]}_{name}"
         f.save(dest)
@@ -325,7 +330,7 @@ def split_text(text, limit=TG_TEXT_LIMIT):
 def tg_send_result(chat_id, out, note):
     """Dökümü sohbete yollar: önce okunabilir metin, sonra .md dosyası ve kare sayfaları."""
     text = (out / "transkript.md").read_text(encoding="utf-8")
-    body = text.split("## Görseller")[0].rstrip()   # görsel listesi sohbette gereksiz
+    body = text.split("\n## Görseller\n")[0].rstrip()   # görsel listesi sohbette gereksiz
     parts = split_text(body)
     for part in parts[:5]:
         tg_text(chat_id, part)
@@ -457,7 +462,8 @@ def cmd_list(argv):
     if not notes:
         print("Henüz döküm yok.")
     for n in notes:
-        print(f"{n['id']}  {vidnote.mmss(n['duration']):>6}  {n['title'][:70]}")
+        size = vidnote.mmss(n["duration"]) if n["duration"] else f"{n['frames']} grs"
+        print(f"{n['id']}  {size:>6}  {n['title'][:70]}")
 
 
 def cmd_show(argv):
