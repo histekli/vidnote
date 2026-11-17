@@ -16,6 +16,7 @@ faster-whisper veya sherpa-onnx (konuşma), yt-dlp (URL).
 import argparse
 import datetime
 import difflib
+import http.cookiejar
 import json
 import os
 import platform
@@ -33,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import requests
 from PIL import Image, ImageDraw, ImageFont
 
 # ---- kare seçimi ayarları -------------------------------------------------
@@ -260,6 +262,197 @@ def fetch_instagram_post(url, workdir, cookies_from_browser=None, cookies_file=N
         raise VidnoteError("Gönderi indirilemedi: " + (" | ".join(err.splitlines()[-2:]) or "gallery-dl hiçbir dosya indirmedi"))
     if not meta["webpage_url"]:
         meta["webpage_url"] = url
+    return images, videos, meta
+
+
+# ---- Threads (threads.com / threads.net) ----------------------------------
+THREADS_RE = re.compile(r"//(www\.)?threads\.(com|net)/")
+THREADS_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/120.0.0.0 Safari/537.36")
+THREADS_MAX_ITEMS = 20          # carousel'de en fazla bu kadar öğe indirilir (aşırı indirmeye karşı)
+THREADS_LOGIN_HELP = (
+    "Threads bu gönderinin verisini vermedi (büyük olasılıkla giriş duvarı). Threads gönderi verisini yalnızca "
+    "giriş yapmış oturuma gömüyor; bu yüzden çerez gerekli. VidNote klasöründeki ayarlar.env dosyasında "
+    "COOKIES_BROWSER= satırına Threads'e (threads.com) giriş yaptığın tarayıcıyı yaz (chrome, firefox, brave, edge), "
+    "ya da COOKIES_FILE= satırına o tarayıcıdan dışa aktardığın cookies.txt dosyasının yolunu yaz; sonra VidNote'u "
+    "kapatıp yeniden aç.")
+
+
+def _threads_shortcode(url):
+    """Threads linkinden gönderi kodunu çıkarır (sorgu parametreleri yok sayılır).
+    /share/ linkleri yönlendirmeli olduğundan son adresten çözülmelidir."""
+    m = re.search(r"/(?:post|t)/([A-Za-z0-9_-]+)", url.split("?")[0])
+    return m.group(1) if m else None
+
+
+def _sjs_blocks(html):
+    """Sayfadaki data-sjs JSON <script> bloklarının içeriğini döndürür."""
+    blocks = []
+    for m in re.finditer(r"<script\b([^>]*)>(.*?)</script>", html, re.DOTALL):
+        attrs, body = m.group(1), m.group(2)
+        if "application/json" in attrs and "data-sjs" in attrs:
+            blocks.append(body)
+    return blocks
+
+
+def _find_thread_items(obj):
+    """JSON ağacında (iç içe) 'thread_items' listelerini toplar."""
+    found = []
+    if isinstance(obj, dict):
+        if isinstance(obj.get("thread_items"), list):
+            found.append(obj["thread_items"])
+        for v in obj.values():
+            found += _find_thread_items(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            found += _find_thread_items(v)
+    return found
+
+
+def _threads_json_from_html(html, code):
+    """Threads sayfasının HTML'inden, kodu verilen gönderinin post nesnesini çıkarır (ağ kullanmaz).
+    Veri yoksa (giriş duvarı) ya da kod eşleşmezse anlaşılır VidnoteError verir."""
+    posts = []
+    for block in _sjs_blocks(html):
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        for items in _find_thread_items(data):
+            for it in items:
+                post = it.get("post") if isinstance(it, dict) else None
+                if not isinstance(post, dict) and isinstance(it, dict) and it.get("code"):
+                    post = it                       # bazı yapılarda öğe doğrudan gönderidir
+                if isinstance(post, dict):
+                    posts.append(post)
+    if not posts:
+        raise VidnoteError(THREADS_LOGIN_HELP)
+    match = next((p for p in posts if p.get("code") == code), None)
+    if match is None:                               # sayfada başka gönderiler (yanıt, öneri) olabilir; onları işleme
+        raise VidnoteError(f"Threads sayfasında {code} kodlu gönderi bulunamadı; sayfadaki başka bir gönderi "
+                           "işlenmedi. Linkin işlemek istediğin gönderiye ait olduğundan emin ol.")
+    return match
+
+
+def _threads_media(post):
+    """Gönderideki tüm medya öğelerini sırayla döndürür; carousel (iç içe olabilir) açılır."""
+    if isinstance(post.get("carousel_media"), list):
+        out = []
+        for child in post["carousel_media"]:
+            if isinstance(child, dict):
+                out += _threads_media(child)
+        return out[:THREADS_MAX_ITEMS]
+    return [post]
+
+
+def _threads_best_image(media):
+    """Medyadaki en geniş görsel URL'si (.jpg) ya da None."""
+    cands = [c for c in ((media.get("image_versions2") or {}).get("candidates") or []) if c.get("url")]
+    return max(cands, key=lambda c: c.get("width") or 0)["url"] if cands else None
+
+
+def _threads_best_video(media):
+    """Medyadaki en geniş video URL'si (.mp4) ya da None."""
+    vers = [v for v in (media.get("video_versions") or []) if v.get("url")]
+    return max(vers, key=lambda v: v.get("width") or 0)["url"] if vers else None
+
+
+def _threads_meta(post, url):
+    """post nesnesinden üst veriyi üretir (ağ kullanmaz)."""
+    user = (post.get("user") or {}).get("username") or ""
+    code = post.get("code") or ""
+    taken = post.get("taken_at")
+    likes = post.get("like_count")
+    date = (datetime.datetime.fromtimestamp(int(taken), datetime.timezone.utc).strftime("%Y-%m-%d")
+            if isinstance(taken, (int, float)) and taken > 0 else "")
+    canonical = f"https://www.threads.com/@{user}/post/{code}" if user and code else url.split("?")[0]
+    return {
+        "title": f"@{user} · {code}" if user else "Threads gönderisi",
+        "description": (post.get("caption") or {}).get("text") or "",
+        "uploader": user,
+        "upload_date": date,
+        "webpage_url": canonical,
+        "site": "Threads",
+        "stats": {"likes": likes} if isinstance(likes, (int, float)) and likes > 0 else {},
+    }
+
+
+def _threads_cookies(cookies_from_browser, cookies_file):
+    """Threads istekleri için çerez kavanozu üretir. cookies_file: Netscape (cookies.txt) biçimi.
+    cookies_from_browser: yt-dlp'nin çerez okuyucusuyla tarayıcıdan alınmaya çalışılır; olmazsa None döner."""
+    if cookies_file:
+        path = Path(cookies_file).expanduser()
+        if not path.exists():
+            raise VidnoteError(f"Çerez dosyası bulunamadı: {cookies_file}")
+        jar = http.cookiejar.MozillaCookieJar(str(path))
+        try:
+            jar.load(ignore_discard=True, ignore_expires=True)
+        except (OSError, http.cookiejar.LoadError) as e:
+            raise VidnoteError(f"Çerez dosyası okunamadı ({cookies_file}): {str(e)[:120]}")
+        return jar
+    if cookies_from_browser:
+        try:                        # yt-dlp'nin iç API'si sürüme göre değişebilir: bağlanma, dene, olmazsa geç
+            from yt_dlp.cookies import extract_cookies_from_browser
+            return extract_cookies_from_browser(cookies_from_browser)
+        except Exception as e:
+            log(f"uyarı: tarayıcıdan ({cookies_from_browser}) çerez okunamadı: {type(e).__name__}: {str(e)[:120]}")
+    return None
+
+
+def _threads_fetch(url, dest, referer):
+    """Tek bir medya dosyasını akış halinde indirir; olmazsa uyarı verip False döner."""
+    try:
+        with requests.get(url, headers={"User-Agent": THREADS_UA, "Referer": referer},
+                          stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(1 << 16):
+                    if chunk:
+                        f.write(chunk)
+        return True
+    except requests.RequestException as e:
+        log(f"uyarı: Threads medyası indirilemedi ({Path(dest).name}): {str(e)[:120]}")
+        return False
+
+
+def _threads_download_media(post, referer, workdir):
+    """Gönderideki görselleri ve videoları workdir altına sıralı adlarla indirir."""
+    images, videos = [], []
+    for item in _threads_media(post):
+        if len(images) + len(videos) >= THREADS_MAX_ITEMS:
+            break
+        vurl = _threads_best_video(item)
+        if vurl:                                    # video öğesinde önizleme görseli yerine videoyu al
+            dest = Path(workdir) / f"thr_vid_{len(videos) + 1:03d}.mp4"
+            if _threads_fetch(vurl, dest, referer):
+                videos.append(dest)
+            continue
+        iurl = _threads_best_image(item)
+        if iurl:
+            dest = Path(workdir) / f"thr_{len(images) + 1:03d}.jpg"
+            if _threads_fetch(iurl, dest, referer):
+                images.append(dest)
+    return images, videos
+
+
+def fetch_threads_post(url, workdir, cookies_from_browser=None, cookies_file=None):
+    """Threads (threads.com / threads.net) gönderisini çeker ve medyasını indirir.
+    (görseller, videolar, üst veri) döndürür — fetch_instagram_post ile aynı biçim.
+    Threads gönderi verisini yalnızca girişli oturuma gömdüğü için çerez gerekir; yalnız metin
+    gönderisinde ([], [], meta) döner. Veri yoksa anlaşılır bir VidnoteError verilir."""
+    jar = _threads_cookies(cookies_from_browser, cookies_file)
+    try:
+        r = requests.get(url, headers={"User-Agent": THREADS_UA, "Accept-Language": "tr,en;q=0.8"},
+                         cookies=jar, allow_redirects=True, timeout=60)
+    except requests.RequestException as e:
+        raise VidnoteError(f"Threads gönderisine ulaşılamadı: {str(e)[:150]}")
+    code = _threads_shortcode(str(r.url)) or _threads_shortcode(url)
+    if not code:
+        raise VidnoteError("Threads linkinden gönderi kodu çıkarılamadı. Bağlantı /@kullanici/post/<kod>, "
+                           "/t/<kod> ya da /share/<kod> biçiminde olmalı.")
+    post = _threads_json_from_html(r.text, code)
+    meta = _threads_meta(post, str(r.url))
+    images, videos = _threads_download_media(post, meta["webpage_url"], workdir)
     return images, videos, meta
 
 
@@ -1146,6 +1339,8 @@ def doc_head(meta):
         L.append(f"- Yayın tarihi: {meta['upload_date']}")
     if meta.get("duration"):
         L.append(f"- Süre: {mmss(meta['duration'])}")
+    elif meta.get("kind") == "text":
+        L.append("- Tür: yalnızca metin gönderisi")
     else:
         L.append(f"- Tür: görsel gönderi ({meta['frames']} görsel)")
     st = meta.get("stats") or {}
@@ -1244,6 +1439,25 @@ def run_images(args, images, src_meta, comments, out, tmp, say, t_all):
     return {"out": out, "transcript": tpath, "sheets": sheets, "meta": meta, "timings": timings}
 
 
+def run_text_post(args, src_meta, comments, out, say, t_all, notes=None):
+    """Yalnızca metin içeren gönderi (ör. Threads media_type 19): açıklama + yorumlar; görsel/video yok."""
+    say("Döküm hazırlanıyor")
+    meta = dict(src_meta, source=args.source_label or args.input, duration=0, frames=0, kind="text",
+                asr="yok", ocr="yok", language=None, created=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    L = doc_head(meta)
+    L += comment_section(comments)
+    for n in notes or []:
+        L += [f"_{n}_", ""]
+    tpath = out / "transkript.md"
+    tpath.write_text("\n".join(L), encoding="utf-8")
+    timings = {"toplam": round(time.time() - t_all, 2)}
+    (out / "pack.json").write_text(json.dumps(
+        {"meta": meta, "timings_sec": timings, "comments": comments or []},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"bitti: {tpath}  (yalnız metin, {timings['toplam']} sn)")
+    return {"out": out, "transcript": tpath, "sheets": [], "meta": meta, "timings": timings}
+
+
 def write_transcript(out, meta, kept, blocks, sheets, comments=None, extra_images=None, notes=None, fixed=0):
     """Tek dosyada, modele verilmeye hazır döküm. Özet değildir; videodaki bilgiyi tekrarsız bir zaman akışına dizer."""
     L = doc_head(meta)
@@ -1328,23 +1542,32 @@ def run(args, progress=None):
             url = args.input
             insta = bool(re.search(r"//(www\.)?instagram\.com/", url))
             src = None
-            if not (insta and "/p/" in url):               # /p/ gönderileri görsel olabilir; onlar aşağıda
-                say("Video indiriliyor")
-                log("indiriliyor…")
-                try:
-                    src, src_meta, comments = fetch_url(url, tmp, args.cookies_from_browser, args.cookies, args.comments, say,
-                                                         args.max_height, not args.no_site_captions, args.lang)
-                except VidnoteError as e:
-                    if not (insta and "no video in this post" in str(e).lower()):
-                        raise
-            if src is None:                                 # görsel ya da çoklu Instagram gönderisi
+            if THREADS_RE.search(url):                      # Threads: yt-dlp/gallery-dl denenmez, kendi çözücümüz
                 say("Gönderi indiriliyor")
-                log("gönderi indiriliyor (gallery-dl)…")
-                images, videos, src_meta = fetch_instagram_post(url, tmp, args.cookies_from_browser, args.cookies)
+                log("threads gönderisi indiriliyor…")
+                images, videos, src_meta = fetch_threads_post(url, tmp, args.cookies_from_browser, args.cookies)
                 src = str(videos[0]) if videos else None
                 if len(videos) > 1:
                     notes.append(f"Gönderide {len(videos)} video var; yalnızca ilki işlendi.")
                 log(f"gönderi: {len(images)} görsel, {len(videos)} video")
+            else:
+                if not (insta and "/p/" in url):           # /p/ gönderileri görsel olabilir; onlar aşağıda
+                    say("Video indiriliyor")
+                    log("indiriliyor…")
+                    try:
+                        src, src_meta, comments = fetch_url(url, tmp, args.cookies_from_browser, args.cookies, args.comments, say,
+                                                             args.max_height, not args.no_site_captions, args.lang)
+                    except VidnoteError as e:
+                        if not (insta and "no video in this post" in str(e).lower()):
+                            raise
+                if src is None:                             # görsel ya da çoklu Instagram gönderisi
+                    say("Gönderi indiriliyor")
+                    log("gönderi indiriliyor (gallery-dl)…")
+                    images, videos, src_meta = fetch_instagram_post(url, tmp, args.cookies_from_browser, args.cookies)
+                    src = str(videos[0]) if videos else None
+                    if len(videos) > 1:
+                        notes.append(f"Gönderide {len(videos)} video var; yalnızca ilki işlendi.")
+                    log(f"gönderi: {len(images)} görsel, {len(videos)} video")
             default_out = re.sub(r"[^\w\-]+", "_", src_meta["title"])[:60].strip("_") or "video"
         else:
             src = args.input
@@ -1369,6 +1592,8 @@ def run(args, progress=None):
         (out / "frames").mkdir(parents=True)
         timings["girdi"] = round(time.time() - t, 2)
         if src is None:
+            if not images:                                  # yalnız metin gönderisi (ör. Threads media_type 19)
+                return run_text_post(args, src_meta, comments, out, say, t_all, notes)
             return run_images(args, images, src_meta, comments, out, tmp, say, t_all)
 
         info = probe(src)
