@@ -5,3 +5,4 @@ faster-whisper
 yt-dlp
 flask
 requests
+gallery-dl
