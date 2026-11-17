@@ -139,6 +139,30 @@ def test_threads_re():
     assert not v.THREADS_RE.search("https://www.youtube.com/watch?v=x")
 
 
+def test_threads_embed():
+    """Gerçek Threads /embed sayfası kaydı: embed URL'si, sayfadan çıkarılan caption/hesap/tarih ve meta."""
+    html = oku("threads_embed.html")
+    # Sayfadaki gerçek değerler (fixture'dan; sabit yazmak yerine HTML'den çıkarılıyor)
+    cap = re.search(r'class="BodyTextContainer"><span>([^<]+)</span>', html)
+    assert cap, "fixture'da BodyTextContainer bulunamadı"
+    kullanici = re.search(r'threads\.com/@([\w.]+)/post/', html)
+    assert kullanici, "fixture'da gönderi linki bulunamadı"
+    tarih = re.search(r"(\d{1,2} \w{3} \d{4})", html)
+    assert tarih, "fixture'da tarih metni bulunamadı"
+
+    embed = v._threads_embed_url("https://www.threads.com/@x/post/AbC123", "AbC123")
+    assert embed == "https://www.threads.com/@x/post/AbC123/embed", embed
+    assert v._threads_embed_url("https://www.threads.com/t/AbC123/", "AbC123").endswith("/t/AbC123/embed")
+
+    meta = v._threads_text_meta("", "AbC123", "https://www.threads.com/@%s/post/AbC123" % kullanici.group(1),
+                                caption=cap.group(1), kullanici=kullanici.group(1), tarih_metni=tarih.group(1))
+    assert meta["description"] == cap.group(1), meta["description"]
+    assert meta["uploader"] == kullanici.group(1), meta["uploader"]
+    assert meta["title"] == "@%s · AbC123" % kullanici.group(1), meta["title"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", meta["upload_date"]), meta["upload_date"]
+    assert meta["site"] == "Threads"
+
+
 TESTLER = [
     ("video fixture: kod + en geniş video + meta alanları", test_video),
     ("carousel: 3 öğe + en geniş görsel/video", test_carousel),
@@ -148,6 +172,7 @@ TESTLER = [
     ("login_wall -> VidnoteError (THREADS_LOGIN_HELP)", test_login_wall),
     ("_threads_shortcode üç durum", test_shortcode),
     ("THREADS_RE threads.com/net yakalar, instagram/youtube yakalamaz", test_threads_re),
+    ("threads /embed: URL + caption/hesap/tarih + meta", test_threads_embed),
 ]
 
 

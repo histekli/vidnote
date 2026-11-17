@@ -160,9 +160,17 @@ User-Agent'la olursa olsun) yalnızca giriş duvarını döndürür. Bu yüzden 
 (Threads'e giriş yaptığın tarayıcı) ya da `COOKIES_FILE` (dışa aktardığın cookies.txt) ayarlanmış olmalı —
 Instagram'daki ile aynı yol. Çerez yoksa VidNote neyi ayarlaman gerektiğini söyleyen bir hata verir.
 
-Threads için yt-dlp/gallery-dl kullanılmaz; sayfaya gömülü JSON (`data-sjs`) doğrudan ayrıştırılır. Threads bu gömülü
-verinin biçimini zaman zaman değiştirdiği için bu yol kırılgandır; biçim değişirse ayrıştırma "gönderi verisi
-bulunamadı" hatası verebilir.
+Threads için yt-dlp/gallery-dl kullanılmaz. Gönderi sayfası veriyi yalnızca JavaScript ile ve `blob:` medya
+adresleriyle yüklediği için VidNote gönderiyi **`/embed`** adresinde, gerçek Chrome'da (Playwright + sistem Chrome)
+açar: videonun gerçek `.mp4` adresi, görseller, açıklama, hesap ve tarih oradan okunur. Carousel'de "sonraki"
+düğmesine tıklanarak öğeler gezilir (en fazla 20 öğe).
+
+Bunun iki sonucu var: sistemde Chrome kurulu olmalı (headless tarayıcı indirilmez) ve çerezler Chrome'dan
+okunur — Linux'ta Chrome çerezleri keyring ile şifrelediği için `gnome-keyring` açık olmalı. Chrome 150 ile
+gerçek bir video gönderisinde uçtan uca denendi (video, açıklama, hesap, tarih, kareler). Carousel ve yalnız
+metin gönderileri canlı denenmedi; carousel tıklama adımı Threads'in düğme etiketine bağlı olduğu için kırılgandır.
+
+Playwright kurulu değilse ya da tarayıcı açılamazsa eski yol (sayfaya gömülü JSON) son çare olarak denenir.
 
 ## Güncelleme
 
@@ -255,4 +263,5 @@ Bilinen eksikler:
 - Konuşan kişinin farklı planları birkaç kez seçiliyor.
 - OCR süslü ya da çok küçük yazıda hata yapıyor; kıyafetteki marka yazısını da ekran yazısı sayıyor.
 - Kareler arasındaki hareket dökümde yok.
-- Uzun YouTube videolarında hazır altyazı kullanılmıyor; konuşma her zaman baştan çözülüyor.
+- Threads carousel'inde "sonraki" düğmesinin etiketi değişirse yalnızca ilk öğe alınır.
+- Threads için sistemde Chrome ve açık bir gnome-keyring gerekir; Playwright tarayıcı indirmez.

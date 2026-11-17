@@ -391,6 +391,10 @@ def _threads_cookies(cookies_from_browser, cookies_file):
             raise VidnoteError(f"Çerez dosyası okunamadı ({cookies_file}): {str(e)[:120]}")
         return jar
     if cookies_from_browser:
+        # Chrome 127+ çerezleri keyring anahtarıyla şifreler. Linux'ta masaüstü ortamı bilinmezse yt-dlp
+        # BASICTEXT anahtarını seçip hiçbir çerezi çözemiyor ve sessizce boş kavanoz döndürüyor.
+        os.environ.setdefault("XDG_CURRENT_DESKTOP", "GNOME")
+        os.environ.setdefault("DESKTOP_SESSION", "gnome")
         try:                        # yt-dlp'nin iç API'si sürüme göre değişebilir: bağlanma, dene, olmazsa geç
             from yt_dlp.cookies import extract_cookies_from_browser
             return extract_cookies_from_browser(cookies_from_browser)
@@ -435,24 +439,182 @@ def _threads_download_media(post, referer, workdir):
     return images, videos
 
 
+THREADS_EMBED_JS = """() => {
+  const medya = [];
+  document.querySelectorAll('video').forEach(v => {
+    const u = v.currentSrc || v.src;
+    if (u && u.startsWith('http')) medya.push({turu: 'video', url: u});
+  });
+  document.querySelectorAll('img').forEach(i => {
+    const u = i.currentSrc || i.src;
+    if (u && u.startsWith('http') && i.naturalWidth >= 300) medya.push({turu: 'foto', url: u});
+  });
+  const cap = document.querySelector('.BodyTextContainer') || document.querySelector('.TextContentContainer');
+  const ts = document.querySelector('.Timestamp');
+  const a = document.querySelector('a[href*="/post/"]');
+  const href = a ? (a.getAttribute('href') || '') : '';
+  const kullanici = href.indexOf('/@') >= 0 ? href.split('/@')[1].split('/')[0] : '';
+  return {metin: document.body.innerText || '',
+          caption: cap ? (cap.innerText || '') : '',
+          tarih: ts ? (ts.innerText || '') : '',
+          kullanici: kullanici,
+          medya: medya};
+}"""
+
+THREADS_AY_MAP = {"oca": 1, "şub": 2, "sub": 2, "mar": 3, "nis": 4, "may": 5, "haz": 6,
+                  "tem": 7, "ağu": 8, "agu": 8, "eyl": 9, "eki": 10, "kas": 11, "ara": 12}
+
+
+def _threads_embed_url(url, code):
+    """Gönderi sayfası yerine /embed sayfasını döndürür: veri (gerçek .mp4 adresi dahil) orada geliyor.
+    Normal gönderi sayfası veriyi yalnızca JS ile, blob: adresleriyle yüklüyor."""
+    m = re.search(r"//(?:www\.)?threads\.(?:com|net)/@([\w.]+)/", url)
+    if m and "/post/" in url:
+        return f"https://www.threads.com/@{m.group(1)}/post/{code}/embed"
+    return f"https://www.threads.com/t/{code}/embed"
+
+
+def _threads_browser_read(embed, jar):
+    """Gönderiyi gerçek Chrome'da (Playwright, sistem Chrome) açar.
+    {metin, caption, tarih, kullanici, medya} döndürür. Girişli oturum şart: çerezler Chrome'dan
+    okunup tarayıcıya aktarılır."""
+    from playwright.sync_api import sync_playwright
+    ck = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path or "/",
+           "secure": bool(c.secure), "sameSite": "Lax"}
+          for c in (jar or [])
+          if any(d in (c.domain or "") for d in ("threads.com", "instagram.com", "cdninstagram.com", "fbcdn.net"))]
+    veri, bulunan = {}, []
+    with sync_playwright() as p:
+        b = p.chromium.launch(channel="chrome", headless=not bool(os.environ.get("DISPLAY")),
+                              args=["--disable-blink-features=AutomationControlled"])
+        try:
+            ctx = b.new_context(locale="tr-TR", viewport={"width": 1100, "height": 950})
+            if ck:
+                ctx.add_cookies(ck)
+            pg = ctx.new_page()
+            pg.goto(embed, wait_until="domcontentloaded", timeout=60000)
+            pg.wait_for_timeout(5000)
+            for _ in range(THREADS_MAX_ITEMS):          # carousel: "sonraki" düğmesiyle öğeleri gez
+                d = pg.evaluate(THREADS_EMBED_JS)
+                for k in ("metin", "caption", "tarih", "kullanici"):
+                    if d.get(k) and not veri.get(k):
+                        veri[k] = d[k]
+                bulunan += d.get("medya") or []
+                try:
+                    btn = pg.locator("[aria-label*='Sonraki' i], [aria-label*='Next' i]").first
+                    if btn.count() == 0 or not btn.is_visible():
+                        break
+                    btn.click(timeout=1500)
+                    pg.wait_for_timeout(1200)
+                except Exception:
+                    break
+        finally:
+            b.close()
+    medya, gorulen = [], set()
+    for m in bulunan:
+        u = m.get("url") or ""
+        anahtar = u.split("?")[0]
+        if not u.startswith("http") or anahtar in gorulen:
+            continue
+        gorulen.add(anahtar)
+        medya.append(m)
+    veri["medya"] = medya[:THREADS_MAX_ITEMS]
+    return veri
+
+
+def _threads_text_meta(text, code, url, caption=None, kullanici=None, tarih_metni=None):
+    """Embed sayfasının metninden üst veri üretir (ağ kullanmaz; testlerde doğrudan çağrılır).
+    Sayfadan seçicilerle alınan caption/kullanici/tarih verilirse onlar kullanılır; yoksa metinden
+    kaba bir çıkarım yapılır."""
+    m = re.search(r"//(?:www\.)?threads\.(?:com|net)/@([\w.]+)/", url or "")
+    kullanici = kullanici or (m.group(1) if m else "")
+    satirlar = [s.strip() for s in (text or "").splitlines() if s.strip()]
+    if not kullanici:
+        for s in satirlar[:8]:
+            if re.fullmatch(r"@[\w.]{2,30}", s):
+                kullanici = s[1:]
+                break
+    tarih = ""
+    ay = r"(oca|şub|sub|mar|nis|may|haz|tem|ağu|agu|eyl|eki|kas|ara)"
+    t = re.search(r"(\d{1,2})\s+" + ay + r"\s+(\d{4})", tarih_metni or text or "", re.I)
+    if t:
+        tarih = f"{int(t.group(3)):04d}-{THREADS_AY_MAP.get(t.group(2).lower(), 0):02d}-{int(t.group(1)):02d}"
+    if not tarih:
+        t = re.search(r"(\d{4})-(\d{2})-(\d{2})", text or "")
+        tarih = t.group(0) if t else ""
+    if caption:
+        description = "\n".join(s.strip() for s in caption.splitlines() if s.strip())
+    else:
+        atilacak = {"takip et", "follow", "threads'ta gör", "giriş yap", "log in", kullanici, f"@{kullanici}"}
+        govde = []
+        for s in satirlar:
+            d = s.casefold()
+            if d in atilacak or len(s) < 3:
+                continue
+            if re.fullmatch(r"[\d.,\s]+[bBmMkK]?", s):          # yalnız sayı: beğeni/yanıt sayacı
+                continue
+            if re.fullmatch(r"\d{1,2}:\d{2}(\s*·\s*.+)?", s):  # saat/tarih satırı
+                continue
+            govde.append(s)
+        description = "\n".join(govde).strip()
+    return {
+        "title": f"@{kullanici} · {code}" if kullanici else f"Threads gönderisi · {code}",
+        "description": description,
+        "uploader": kullanici,
+        "upload_date": tarih,
+        "webpage_url": (f"https://www.threads.com/@{kullanici}/post/{code}" if kullanici
+                        else (url or "").split("?")[0]),
+        "site": "Threads",
+        "stats": {},
+    }
+
+
 def fetch_threads_post(url, workdir, cookies_from_browser=None, cookies_file=None):
     """Threads (threads.com / threads.net) gönderisini çeker ve medyasını indirir.
     (görseller, videolar, üst veri) döndürür — fetch_instagram_post ile aynı biçim.
-    Threads gönderi verisini yalnızca girişli oturuma gömdüğü için çerez gerekir; yalnız metin
-    gönderisinde ([], [], meta) döner. Veri yoksa anlaşılır bir VidnoteError verilir."""
-    jar = _threads_cookies(cookies_from_browser, cookies_file)
-    try:
-        r = requests.get(url, headers={"User-Agent": THREADS_UA, "Accept-Language": "tr,en;q=0.8"},
-                         cookies=jar, allow_redirects=True, timeout=60)
-    except requests.RequestException as e:
-        raise VidnoteError(f"Threads gönderisine ulaşılamadı: {str(e)[:150]}")
-    code = _threads_shortcode(str(r.url)) or _threads_shortcode(url)
+    Gönderi sayfası veriyi JS ile ve blob: adresleriyle yüklediği için /embed sayfası gerçek Chrome'da
+    açılır (Playwright + sistem Chrome). Giriş şart: çerezler tarayıcıdan okunur. Yalnız metin
+    gönderisinde ([], [], meta) döner."""
+    code = _threads_shortcode(url)
     if not code:
         raise VidnoteError("Threads linkinden gönderi kodu çıkarılamadı. Bağlantı /@kullanici/post/<kod>, "
                            "/t/<kod> ya da /share/<kod> biçiminde olmalı.")
-    post = _threads_json_from_html(r.text, code)
-    meta = _threads_meta(post, str(r.url))
-    images, videos = _threads_download_media(post, meta["webpage_url"], workdir)
+    jar = _threads_cookies(cookies_from_browser, cookies_file)
+    embed = _threads_embed_url(url, code)
+    veri = {}
+    try:
+        veri = _threads_browser_read(embed, jar) or {}
+        log(f"threads: /embed okundu ({len(veri.get('medya') or [])} medya öğesi)")
+    except Exception as e:                       # Playwright yok / tarayıcı açılamadı: son çare HTML yolu
+        log(f"uyarı: threads tarayıcı okuması başarısız ({type(e).__name__}: {str(e)[:120]}); "
+            "sayfa HTML'i denenecek")
+    metin, medya = veri.get("metin") or "", veri.get("medya") or []
+    if not medya and not veri.get("caption"):    # eski yol: bazı sayfalarda veri HTML'e gömülü olabiliyor
+        try:
+            r = requests.get(url, headers={"User-Agent": THREADS_UA, "Accept-Language": "tr,en;q=0.8"},
+                             cookies=jar, allow_redirects=True, timeout=60)
+            post = _threads_json_from_html(r.text, code)
+            meta = _threads_meta(post, str(r.url))
+            images, videos = _threads_download_media(post, meta["webpage_url"], workdir)
+            return images, videos, meta
+        except requests.RequestException as e:
+            raise VidnoteError(f"Threads gönderisine ulaşılamadı: {str(e)[:150]}")
+        except VidnoteError:
+            if not metin:                        # ne medya ne metin: giriş yok ya da çerez okunamadı
+                raise VidnoteError(THREADS_LOGIN_HELP)
+    meta = _threads_text_meta(metin, code, url, veri.get("caption"), veri.get("kullanici"), veri.get("tarih"))
+    images, videos = [], []
+    for m in medya:
+        if m["turu"] == "video":
+            dest = Path(workdir) / f"thr_vid_{len(videos) + 1:03d}.mp4"
+            if _threads_fetch(m["url"], dest, meta["webpage_url"]):
+                videos.append(dest)
+        else:
+            dest = Path(workdir) / f"thr_{len(images) + 1:03d}.jpg"
+            if _threads_fetch(m["url"], dest, meta["webpage_url"]):
+                images.append(dest)
+    if len(videos) > 1:
+        log(f"threads: {len(videos)} video bulundu; yalnızca ilki işlenecek")
     return images, videos, meta
 
 
